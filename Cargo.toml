@@ -1,0 +1,63 @@
+[package]
+name = "utxo2webgraph"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Bitcoin Payment Graph pipeline: transaction list -> node map + edge list -> BVGraph"
+authors = ["Ported from the Java pipeline by Matteo Loporchio"]
+license = "Apache-2.0 OR MIT"
+publish = false
+
+[lib]
+name = "utxo2webgraph"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pgraph"
+path = "src/main.rs"
+
+[dependencies]
+# The local, READ-ONLY webgraph-rs checkout. Cargo builds it into OUR target
+# directory; it never writes into the checkout. Never run cargo inside it.
+webgraph = { path = "/home/mnocentini/Developer/working-copies/webgraph-rs/webgraph" }
+
+anyhow              = { version = "1.0.79", features = ["backtrace"] }
+chrono              = { version = "0.4", default-features = false, features = ["clock", "std"] }
+chrono-tz           = "0.10"
+clap                = { version = "4.5.11", features = ["derive", "wrap_help"] }
+dsi-bitstream       = "0.9.1"
+dsi-progress-logger = "0.8"
+env_logger          = { version = "0.11.5", default-features = false, features = ["auto-color", "regex"] }
+itoa                = "1.0"
+log                 = "0.4.22"
+rayon               = "1.10.0"
+rdst                = "0.20"
+tempfile            = "3.10.1"
+thiserror           = "2.0.12"
+
+[dev-dependencies]
+tempfile = "3.10.1"
+# Only `tests/golden.rs` needs this: reading a compressed BVGraph back requires
+# the `lender::for_!` macro, because `webgraph` exposes graphs as lending
+# iterators rather than plain `Iterator`s. Same version the webgraph-rs
+# workspace pins (`webgraph-rs/Cargo.toml:21`), so it unifies to one copy.
+lender = "0.6.0"
+
+[profile.release]
+opt-level       = 3
+lto             = "fat"
+codegen-units   = 1
+debug           = true
+# DELIBERATE: the webgraph workspace disables these, but webgraph's own
+# Compressor::write (comp/bvcomp.rs:232) computes `residuals[i] - residuals[i-1] - 1`,
+# which SILENTLY WRAPS and writes a corrupt bitstream if a duplicate or
+# out-of-order successor ever reaches it. A few percent of throughput is cheap
+# insurance against a corrupt 210 GB graph. Use `--profile fast` to disable.
+overflow-checks = true
+# NOTE: do NOT set `panic = "abort"`. The sequential webgraph path asserts
+# rather than errors on unsorted input (arc_list_graph.rs:162, :261), and
+# compress.rs wraps it in catch_unwind to turn that into a typed PgError.
+
+[profile.fast]
+inherits        = "release"
+overflow-checks = false

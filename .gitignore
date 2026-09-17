@@ -1,0 +1,16 @@
+# Build artifacts
+/target/
+
+# Runtime output directories created by the pipeline (--tmp-dir / --log-dir)
+/tmp/
+/logs/
+/graph/
+/chunks/
+
+# Spill runs and atomic-write leftovers
+pgraph-sort-*/
+*.pgraph-tmp-*
+
+# Editor / OS noise
+*.swp
+.DS_Store
