@@ -32,6 +32,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::{Datelike, TimeZone, Utc};
 use chrono_tz::Tz;
+use dsi_progress_logger::prelude::*;
 
 use crate::{PgError, PgResult};
 
@@ -465,7 +466,17 @@ fn leading_timestamp(line: &[u8]) -> Option<i64> {
 /// fidelity, but it is now logged loudly with the record number, the timestamp
 /// and the bytes consumed so far; [`SplitOpts::skip_out_of_range`] turns it
 /// into a `continue`.
-pub fn split<R: BufRead>(mut input: R, out_dir: &Path, opts: &SplitOpts) -> PgResult<SplitStats> {
+///
+/// `pl` is ticked once per input record. At full scale this is a 135 GB
+/// sequential copy that used to print the boundary table and then nothing at
+/// all until it finished. No `expected_updates`: the record count of the
+/// master list is not known without reading it, which is what this pass is.
+pub fn split<R: BufRead>(
+    mut input: R,
+    out_dir: &Path,
+    opts: &SplitOpts,
+    pl: &mut impl ProgressLog,
+) -> PgResult<SplitStats> {
     let b = compute_boundaries(opts)?;
     let n = b.upper.len();
     let end_ts = *b
@@ -499,6 +510,10 @@ pub fn split<R: BufRead>(mut input: R, out_dir: &Path, opts: &SplitOpts) -> PgRe
     }
 
     log::info!("{}", format_boundary_table(&b));
+    // "record", matching the `records_written` / `records_before_start`
+    // counters `main.rs` reports when the split finishes.
+    pl.item_name("record");
+    pl.start(format!("Splitting into {n} chunks..."));
 
     let mut current = 0usize;
     let mut writer: Option<BufWriter<File>> = None;
@@ -517,6 +532,7 @@ pub fn split<R: BufRead>(mut input: R, out_dir: &Path, opts: &SplitOpts) -> PgRe
         }
         bytes_read += read as u64;
         line_no += 1;
+        pl.light_update();
 
         if line.iter().all(|b| b.is_ascii_whitespace()) {
             // awk compares an empty $1 as a string and takes the `next`
@@ -592,6 +608,7 @@ pub fn split<R: BufRead>(mut input: R, out_dir: &Path, opts: &SplitOpts) -> PgRe
     if let Some(w) = writer.take() {
         finish_chunk(w, &paths[current])?;
     }
+    pl.done_with_count(line_no as usize);
     Ok(stats)
 }
 
@@ -709,7 +726,7 @@ mod tests {
             input.push_str(&format!("{},0,{},1,0,0,0::a,1,1\n", cut + i, 5 + i));
         }
 
-        let stats = split(Cursor::new(input.clone()), dir.path(), &opts).unwrap();
+        let stats = split(Cursor::new(input.clone()), dir.path(), &opts, no_logging!()).unwrap();
         assert_eq!(stats.records_written, 10);
         assert_eq!(stats.records_before_start, 0);
         assert!(stats.stopped_early_at.is_none());
@@ -735,7 +752,7 @@ mod tests {
         let opts = two_chunk_opts();
         let b = compute_boundaries(&opts).unwrap();
         let input = format!("{},0,0,1,0,0,0::a,1,1\n", b.start_ts);
-        let stats = split(Cursor::new(input), dir.path(), &opts).unwrap();
+        let stats = split(Cursor::new(input), dir.path(), &opts, no_logging!()).unwrap();
         assert_eq!(stats.chunks[1].records, 0);
         let empty = dir.path().join("chunk_02.txt");
         assert!(
@@ -757,7 +774,7 @@ mod tests {
             end,
             b.start_ts + 1
         );
-        let stats = split(Cursor::new(input), dir.path(), &opts).unwrap();
+        let stats = split(Cursor::new(input), dir.path(), &opts, no_logging!()).unwrap();
         assert_eq!(stats.stopped_early_at, Some((2, end)));
         assert_eq!(
             stats.records_written, 1,
@@ -776,7 +793,7 @@ mod tests {
             end,
             b.start_ts + 1
         );
-        let stats2 = split(Cursor::new(input), dir2.path(), &opts2).unwrap();
+        let stats2 = split(Cursor::new(input), dir2.path(), &opts2, no_logging!()).unwrap();
         assert_eq!(stats2.stopped_early_at, Some((2, end)));
         assert_eq!(stats2.records_written, 2);
     }
@@ -790,7 +807,7 @@ mod tests {
             "1,0,0,1,0,0,0::a,1,1\n{},0,1,1,0,0,0::a,1,1",
             b.start_ts + 3
         );
-        let stats = split(Cursor::new(input), dir.path(), &opts).unwrap();
+        let stats = split(Cursor::new(input), dir.path(), &opts, no_logging!()).unwrap();
         assert_eq!(stats.records_before_start, 1);
         assert_eq!(stats.records_written, 1);
         let c1 = fs::read_to_string(dir.path().join("chunk_01.txt")).unwrap();

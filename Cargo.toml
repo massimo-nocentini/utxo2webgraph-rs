@@ -35,6 +35,13 @@ dsi-bitstream       = "0.9.1"
 dsi-progress-logger = "0.8"
 env_logger          = { version = "0.11.5", default-features = false, features = ["auto-color", "regex"] }
 itoa                = "1.0"
+# Only `src/logging.rs` needs this: the log line format is a copy of
+# webgraph-rs `cli/src/lib.rs:998-1037`, whose compact elapsed span
+# (`1h2m3s456ms`) is a `jiff::fmt::friendly::SpanPrinter`. `chrono` (above)
+# has no equivalent printer, and matching upstream's line shape byte for byte
+# is the whole point. Free: jiff 0.2 is already in the normal dependency graph
+# via `sux` -> `env_logger`, so this compiles no additional crate.
+jiff                = "0.2"
 log                 = "0.4.22"
 rayon               = "1.10.0"
 rdst                = "0.20"

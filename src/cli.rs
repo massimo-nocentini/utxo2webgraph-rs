@@ -12,11 +12,12 @@
 //! that names them to compile against `clap`.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 
 use crate::compress::VerifyLevel;
-use crate::{ArcCodec, Mode, NodeMapKind, OnMissingSource, SortAlgo, StatsStyle};
+use crate::{ArcCodec, Mode, OnMissingSource, SortAlgo, StatsStyle};
 
 /// The shell-to-Rust equivalence table, shown by `pgraph --help`.
 const LONG_ABOUT: &str = "\
@@ -100,9 +101,21 @@ pub struct CommonOpts {
     #[arg(long, global = true, conflicts_with = "strict")]
     pub lenient: bool,
 
-    /// Log verbosity: -v = debug, -vv = trace. `RUST_LOG` overrides.
+    /// Log verbosity: -v = debug, -vv = trace. `RUST_LOG` layers on top.
     #[arg(short, long, global = true, action = ArgAction::Count)]
     pub verbose: u8,
+
+    /// How often the long loops log their progress.
+    ///
+    /// Suffixes `s`, `m`, `h`, `d`; a bare number is milliseconds. They
+    /// accumulate: `1d2h3m4s567`.
+    // Upstream webgraph-rs flattens a per-subcommand `LogIntervalArg` instead.
+    // `global = true` is a deliberate divergence: every other field of this
+    // struct is global, so `pgraph --log-interval 1m build 15` and `pgraph
+    // build 15 --log-interval 1m` must mean the same thing, and there is no
+    // stage whose progress interval would sensibly differ from the run's.
+    #[arg(long, global = true, value_name = "DURATION", value_parser = parse_duration, default_value = "10s")]
+    pub log_interval: Duration,
 
     /// Report the resolved plan and touch nothing.
     #[arg(long, global = true)]
@@ -114,19 +127,6 @@ pub struct CommonOpts {
     /// byte-for-byte, including its mislabelled `Nodes:` counter.
     #[arg(long, global = true, value_enum, default_value_t = StatsArg::Java)]
     pub stats: StatsArg,
-
-    /// Refuse inputs larger than this without `--i-know-this-is-big`.
-    ///
-    /// The default lets `chunks/chunk_01.txt` (976 KB) through and stops
-    /// `finalBCUTXO_2022` (135 GB) and `chunks/chunk_05.txt` (84 MB) from being
-    /// started by accident.
-    #[arg(long, global = true, value_name = "SIZE", value_parser = crate::parse_memory_spec,
-          default_value = "16MiB")]
-    pub max_input_bytes: u64,
-
-    /// Allow inputs above `--max-input-bytes`, including `finalBCUTXO_2022`.
-    #[arg(long, global = true)]
-    pub i_know_this_is_big: bool,
 }
 
 impl CommonOpts {
@@ -287,10 +287,6 @@ pub struct EdgeListArgs {
     #[arg(long, value_enum, default_value_t = ArcCodecArg::Packed32)]
     pub arc_codec: ArcCodecArg,
 
-    /// Node-map index strategy.
-    #[arg(long, value_enum, default_value_t = NodeMapKindArg::Dense)]
-    pub node_map_kind: NodeMapKindArg,
-
     /// Pre-size the dense node map (default: grow geometrically).
     #[arg(long, value_name = "N")]
     pub max_tx_id: Option<usize>,
@@ -443,10 +439,6 @@ pub struct BuildPgArgs {
     #[arg(long, value_enum, default_value_t = ArcCodecArg::Packed32)]
     pub arc_codec: ArcCodecArg,
 
-    /// Node-map index strategy.
-    #[arg(long, value_enum, default_value_t = NodeMapKindArg::Dense)]
-    pub node_map_kind: NodeMapKindArg,
-
     /// Pre-size the dense node map.
     #[arg(long, value_name = "N")]
     pub max_tx_id: Option<usize>,
@@ -511,10 +503,6 @@ pub struct BuildArgs {
     /// Arc representation.
     #[arg(long, value_enum, default_value_t = ArcCodecArg::Packed32)]
     pub arc_codec: ArcCodecArg,
-
-    /// Node-map index strategy.
-    #[arg(long, value_enum, default_value_t = NodeMapKindArg::Dense)]
-    pub node_map_kind: NodeMapKindArg,
 
     /// Pre-size the dense node map to N transactions (default: grow
     /// geometrically, which costs about 1.35x the steady-state array while it
@@ -636,24 +624,6 @@ impl From<VerifyArg> for VerifyLevel {
     }
 }
 
-/// CLI mirror of [`NodeMapKind`].
-#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
-pub enum NodeMapKindArg {
-    /// `Vec<u64>` indexed by txId; requires dense, monotone txIds.
-    Dense,
-    /// Literal port of the Java `HashMap<Long, Long>`.
-    Hash,
-}
-
-impl From<NodeMapKindArg> for NodeMapKind {
-    fn from(a: NodeMapKindArg) -> NodeMapKind {
-        match a {
-            NodeMapKindArg::Dense => NodeMapKind::Dense,
-            NodeMapKindArg::Hash => NodeMapKind::Hash,
-        }
-    }
-}
-
 /// CLI mirror of [`ArcCodec`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 pub enum ArcCodecArg {
@@ -758,6 +728,54 @@ pub fn parse_num_nodes(s: &str) -> Result<NumNodesSpec, String> {
     }
 }
 
+/// Parses `--log-interval`.
+///
+/// A port of webgraph-rs `cli/src/lib.rs`, so a duration accepted by
+/// `webgraph` is accepted here and means the same thing. For compatibility
+/// with the Java pipeline a bare number is **milliseconds**; the suffixes are
+/// `s` (seconds), `m` (minutes), `h` (hours) and `d` (days), and they
+/// accumulate: `1d2h3m4s567` is one day, two hours, three minutes, four
+/// seconds and 567 milliseconds.
+///
+/// Private, exactly as upstream has it: `clap`'s `value_parser` does not need
+/// a public function, and widening the library's API would oblige it to carry
+/// a doc under `#![warn(missing_docs)]` for something nothing outside this
+/// file calls. Upstream's two `anyhow` bails become `Err(String)`, which is
+/// what `clap` renders as the user-facing message.
+fn parse_duration(value: &str) -> Result<Duration, String> {
+    if value.is_empty() {
+        return Err("empty duration string; for every 0 milliseconds use `0`".to_string());
+    }
+    let mut duration = Duration::from_secs(0);
+    let mut acc = String::new();
+    for c in value.chars() {
+        if c.is_ascii_digit() {
+            acc.push(c);
+        } else if c.is_whitespace() {
+            continue;
+        } else {
+            let dur = acc
+                .parse::<u64>()
+                .map_err(|e| format!("invalid duration {value:?}: {e}"))?;
+            match c {
+                's' => duration += Duration::from_secs(dur),
+                'm' => duration += Duration::from_secs(dur * 60),
+                'h' => duration += Duration::from_secs(dur * 60 * 60),
+                'd' => duration += Duration::from_secs(dur * 60 * 60 * 24),
+                _ => return Err(format!("invalid duration suffix: {c}")),
+            }
+            acc.clear();
+        }
+    }
+    if !acc.is_empty() {
+        let dur = acc
+            .parse::<u64>()
+            .map_err(|e| format!("invalid duration {value:?}: {e}"))?;
+        duration += Duration::from_millis(dur);
+    }
+    Ok(duration)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -782,6 +800,36 @@ mod tests {
             NumNodesSpec::Explicit(2_147_483_647)
         );
         assert!(parse_num_nodes("nope").is_err());
+    }
+
+    #[test]
+    fn log_interval_parses_like_webgraph() {
+        // The example from upstream's own doc comment.
+        assert_eq!(
+            parse_duration("1d2h3m4s567").unwrap(),
+            Duration::from_secs(((24 + 2) * 60 + 3) * 60 + 4) + Duration::from_millis(567)
+        );
+        // A bare number is MILLISECONDS, not seconds: Java compatibility.
+        assert_eq!(parse_duration("500").unwrap(), Duration::from_millis(500));
+        assert_eq!(parse_duration("10s").unwrap(), Duration::from_secs(10));
+        assert_eq!(parse_duration("0").unwrap(), Duration::ZERO);
+        // Whitespace is ignored, as upstream does.
+        assert_eq!(parse_duration("1m 30s").unwrap(), Duration::from_secs(90));
+        assert!(parse_duration("").is_err());
+        assert!(parse_duration("3x").is_err());
+    }
+
+    #[test]
+    fn log_interval_is_global_and_defaults_to_ten_seconds() {
+        let before = Cli::try_parse_from(["pgraph", "--log-interval", "1m5s", "build", "1"])
+            .expect("--log-interval before the subcommand");
+        let after = Cli::try_parse_from(["pgraph", "build", "1", "--log-interval", "1m5s"])
+            .expect("--log-interval after the subcommand");
+        assert_eq!(before.common.log_interval, Duration::from_secs(65));
+        assert_eq!(after.common.log_interval, before.common.log_interval);
+
+        let default = Cli::try_parse_from(["pgraph", "build", "1"]).expect("defaults");
+        assert_eq!(default.common.log_interval, Duration::from_secs(10));
     }
 
     #[test]

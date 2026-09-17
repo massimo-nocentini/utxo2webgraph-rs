@@ -38,7 +38,9 @@ use std::io::{BufRead, BufWriter, Write};
 use std::path::Path;
 use std::time::Instant;
 
-use crate::nodemap::NodeMap;
+use dsi_progress_logger::prelude::*;
+
+use crate::nodemap::DenseNodeMap;
 use crate::record::{self, ParseOpts};
 use crate::{
     sync_if_durable, ArcSink, Mode, NodeId, OnMissingSource, PgError, PgResult, StatsStyle,
@@ -133,13 +135,25 @@ pub struct EdgeListStats {
 /// dump at lines 89-94), so the caller must write the node map first and then
 /// call [`print_stats`] with `elapsed_secs` refreshed from a clock it owns.
 /// `main.rs` does exactly that and overwrites the field.
+///
+/// # Progress
+///
+/// `pl` is ticked once per transaction and is entirely separate from the
+/// `--progress-every` stdout line, which is a Java compatibility contract and
+/// is not a log. Pass `no_logging!()` to suppress it.
 pub fn build_edge_list<R: BufRead>(
     mut input: R,
-    node_map: &mut dyn NodeMap,
+    node_map: &mut DenseNodeMap,
     sink: &mut dyn ArcSink,
     opts: EdgeListOpts,
+    pl: &mut impl ProgressLog,
 ) -> PgResult<EdgeListStats> {
     let start = Instant::now();
+    // No `expected_updates`: the transaction count is one line per input line
+    // and nothing has counted the lines. An estimate here would put a wrong
+    // percentage and a wrong ETA on every progress line.
+    pl.item_name("transaction");
+    pl.start("Building the edge list...");
     let parse_opts = ParseOpts { mode: opts.mode };
     // Reused across the whole run: never reallocated per line.
     let mut out_ids: Vec<NodeId> = Vec::with_capacity(1024);
@@ -222,7 +236,7 @@ pub fn build_edge_list<R: BufRead>(
                         }
                         OnMissingSource::Create => {
                             stats.dangling_refs += 1;
-                            node_map.force_create(prev_tx, prev_off)?
+                            node_map.force_create(prev_tx, prev_off, line_no)?
                         }
                     },
                 };
@@ -235,6 +249,7 @@ pub fn build_edge_list<R: BufRead>(
         }
 
         stats.tx_count += 1;
+        pl.light_update();
         if opts.progress_every != 0
             && stats.tx_count % opts.progress_every == 0
             && !opts.quiet_stats
@@ -246,6 +261,7 @@ pub fn build_edge_list<R: BufRead>(
     sink.finish()?;
     stats.distinct_nodes = node_map.distinct_nodes();
     stats.elapsed_secs = start.elapsed().as_secs();
+    pl.done_with_count(stats.tx_count as usize);
     Ok(stats)
 }
 
@@ -256,37 +272,66 @@ pub fn build_edge_list<R: BufRead>(
 /// 132 GB of chunks silently truncated the file while the program printed
 /// `Nodes: … Edges: …` and exited 0. Here every write is checked, and the file
 /// is flushed **and** `sync_all`'d before the caller prints its statistics.
-pub fn write_node_map(node_map: &dyn NodeMap, path: &Path) -> PgResult<u64> {
+///
+/// `pl` counts **bytes**, because that is the only quantity this function sees
+/// incrementally: the node map is rendered by `DenseNodeMap::write_tsv` in one
+/// call, so there is no row-by-row hook to tick. At `N = 28` this writes 55 GB
+/// and used to be a single silent phase.
+pub fn write_node_map(
+    node_map: &DenseNodeMap,
+    path: &Path,
+    pl: &mut impl ProgressLog,
+) -> PgResult<u64> {
     let file = File::create(path).map_err(|e| PgError::io(path, e))?;
+    pl.item_name("byte");
+    // No path in the message: `path` here is the caller's atomic *temporary*
+    // file, and every caller has already logged the destination it will be
+    // renamed to. Naming both logged the same phase twice, under two different
+    // paths, one of which never survives the run.
+    pl.start("Writing the node map...");
     let mut w = CountingWriter {
         inner: BufWriter::with_capacity(NODE_MAP_BUF, file),
         written: 0,
+        pl,
     };
     node_map.write_tsv(&mut w)?;
-    let written = w.written;
-    let mut inner = w.inner;
+    let CountingWriter {
+        mut inner,
+        written,
+        pl,
+    } = w;
     inner.flush().map_err(|e| PgError::io(path, e))?;
     // `fsync` on `/dev/null` or a fifo returns EINVAL; a fully written node
     // map must not be reported as a failure because of that.
     sync_if_durable(inner.get_ref(), path)?;
+    pl.done_with_count(written as usize);
     Ok(written)
 }
 
-/// A `Write` that tallies the bytes it forwards.
-struct CountingWriter {
+/// A `Write` that tallies the bytes it forwards and reports them to a
+/// [`ProgressLog`].
+///
+/// `update_with_count`, not `light_update`: one call here covers a whole
+/// buffer, and `light_update` only consults the clock once every 2^20 calls,
+/// so a writer that makes one call per 8 KiB block would log roughly once per
+/// 8 GiB regardless of `--log-interval`.
+struct CountingWriter<'a, P: ProgressLog> {
     inner: BufWriter<File>,
     written: u64,
+    pl: &'a mut P,
 }
 
-impl Write for CountingWriter {
+impl<P: ProgressLog> Write for CountingWriter<'_, P> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let n = self.inner.write(buf)?;
         self.written += n as u64;
+        self.pl.update_with_count(n);
         Ok(n)
     }
     fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
         self.inner.write_all(buf)?;
         self.written += buf.len() as u64;
+        self.pl.update_with_count(buf.len());
         Ok(())
     }
     fn flush(&mut self) -> std::io::Result<()> {
@@ -333,8 +378,12 @@ pub fn print_progress(tx_count: u64, elapsed_secs: u64) {
 ///
 /// `Nodes:` is Java's mislabelled `nodeCount`: it counts output **slots**, not
 /// distinct nodes, because line 64 incremented it without checking whether
-/// `getOrCreateId` created anything. The two coincide on this corpus only
-/// because transaction ids are globally unique.
+/// `getOrCreateId` created anything. The two differ by exactly the number of
+/// output slots belonging to a re-emitted transaction id — two, over the whole
+/// corpus, for the BIP-30 duplicate coinbases described in [`crate::nodemap`] —
+/// plus any node minted by [`crate::OnMissingSource::Create`]. `Nodes:` is
+/// reproduced as Java printed it; [`StatsStyle::Extended`] prints the honest
+/// count beside it.
 ///
 /// Under [`StatsStyle::Extended`] two further lines follow with the corrected
 /// counters.
@@ -359,7 +408,6 @@ pub fn print_stats(stats: &EdgeListStats, style: StatsStyle) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::nodemap::DenseNodeMap;
 
     /// Collects arcs in emission order.
     struct VecSink {
@@ -391,7 +439,8 @@ mod tests {
     fn run(input: &str, opts: EdgeListOpts) -> (EdgeListStats, Vec<(NodeId, NodeId)>, u64) {
         let mut map = DenseNodeMap::new(opts.mode);
         let mut sink = VecSink::new();
-        let stats = build_edge_list(input.as_bytes(), &mut map, &mut sink, opts).unwrap();
+        let stats =
+            build_edge_list(input.as_bytes(), &mut map, &mut sink, opts, no_logging!()).unwrap();
         assert!(sink.finished);
         (stats, sink.arcs, map.next_id())
     }
@@ -427,6 +476,7 @@ mod tests {
                 quiet_stats: true,
                 ..Default::default()
             },
+            no_logging!(),
         )
         .expect("lenient run survives a stray byte, as Java did");
         assert_eq!(stats.tx_count, 2);
@@ -444,6 +494,7 @@ mod tests {
                 quiet_stats: true,
                 ..Default::default()
             },
+            no_logging!(),
         )
         .expect_err("strict mode reports it");
         match err {
@@ -542,7 +593,13 @@ mod tests {
                      2,1,1,0,0,0,0:x,5,999,0:b,2,2\n";
         let mut map = DenseNodeMap::new(Mode::Strict);
         let mut sink = VecSink::new();
-        match build_edge_list(input.as_bytes(), &mut map, &mut sink, quiet()) {
+        match build_edge_list(
+            input.as_bytes(),
+            &mut map,
+            &mut sink,
+            quiet(),
+            no_logging!(),
+        ) {
             Err(PgError::DanglingSource {
                 line: 2,
                 tx_id: 1,
@@ -568,19 +625,66 @@ mod tests {
         assert_eq!(next_id, 2);
     }
 
+    /// The reachable `create` case: a chunk that starts above genesis (txIds
+    /// 10, 11) and spends an output of transaction 5, which lives in an earlier
+    /// chunk this run does not have. The reference is *behind* the cursor, so a
+    /// node can be minted for it without ever colliding with a dense id.
     #[test]
     fn dangling_source_can_be_created() {
-        let input = "1,0,0,1,0,0,0::a,1,1\n\
-                     2,1,1,0,0,0,0:x,5,999,0:b,2,2\n";
+        let input = "1,0,10,1,0,0,0::a,1,1\n\
+                     2,1,11,0,0,0,0:x,0,5,0:b,2,2\n";
         let opts = EdgeListOpts {
             on_missing_source: OnMissingSource::Create,
             ..quiet()
         };
         let (stats, arcs, next_id) = run(input, opts);
-        // tx 1's own output took id 1, so the minted node is id 2.
+        // tx 11's own output took id 1, so the minted node is id 2.
         assert_eq!(arcs, vec![(2, 1)]);
         assert_eq!(stats.dangling_refs, 1);
         assert_eq!(next_id, 3);
+    }
+
+    /// A dangling reference to a transaction the run has **not read yet**
+    /// cannot be minted: the dense cursor would reach that transaction later
+    /// and hand the same output a second id. `create` refuses rather than
+    /// corrupt the node map; `skip` and `fail` are unaffected because neither
+    /// mints anything.
+    #[test]
+    fn forward_dangling_source_cannot_be_created() {
+        // tx 0 spends (5, 0); transaction 5 arrives three lines later.
+        let input = "1,0,0,1,0,0,0:x,0,5,0:a,1,1\n\
+                     1,0,1,1,0,0,0::a,1,1\n\
+                     1,0,2,1,0,0,0::a,1,1\n\
+                     1,0,3,1,0,0,0::a,1,1\n\
+                     1,0,4,1,0,0,0::a,1,1\n\
+                     1,0,5,1,0,0,0::a,1,1\n";
+        let opts = EdgeListOpts {
+            on_missing_source: OnMissingSource::Create,
+            ..quiet()
+        };
+        let mut map = DenseNodeMap::new(Mode::Strict);
+        let mut sink = VecSink::new();
+        match build_edge_list(input.as_bytes(), &mut map, &mut sink, opts, no_logging!()) {
+            Err(PgError::ForwardForcedNode {
+                line: 1,
+                tx_id: 5,
+                offset: 0,
+                reached: 0,
+            }) => {}
+            other => panic!("expected ForwardForcedNode, got {other:?}"),
+        }
+
+        // And the same input is fine under the two non-minting policies.
+        let (stats, arcs, next_id) = run(
+            input,
+            EdgeListOpts {
+                on_missing_source: OnMissingSource::Skip,
+                ..quiet()
+            },
+        );
+        assert!(arcs.is_empty());
+        assert_eq!(stats.dangling_refs, 1);
+        assert_eq!(next_id, 6);
     }
 
     #[test]
@@ -589,7 +693,13 @@ mod tests {
                      not-a-record\n";
         let mut map = DenseNodeMap::new(Mode::Strict);
         let mut sink = VecSink::new();
-        match build_edge_list(input.as_bytes(), &mut map, &mut sink, quiet()) {
+        match build_edge_list(
+            input.as_bytes(),
+            &mut map,
+            &mut sink,
+            quiet(),
+            no_logging!(),
+        ) {
             Err(PgError::BadSectionCount { line: 2, found: 1 }) => {}
             other => panic!("expected BadSectionCount, got {other:?}"),
         }

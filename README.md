@@ -54,17 +54,19 @@ what the shell pipeline produced — the rows above are drop-in replacements wit
 no extra flags. `--num-nodes node-map` is the opt-in richer graph; see
 section 6.
 
-Two of these commands read very large files. `pgraph` refuses any input above
-`--max-input-bytes` (default 16 MiB) and refuses `finalBCUTXO_2022` outright
-unless `--i-know-this-is-big` is passed, so the first line of the table is
-really
+Some of these commands read very large files, and nothing in `pgraph` caps the
+input size: the rows above are literally what you type, `finalBCUTXO_2022`
+included. What the commands do instead is estimate their output from the input
+size and refuse to start a run that cannot finish. `split`, `edge-list` and
+`build`/`build-pg` check the free space on every volume they are about to write
+to and stop rather than fill it (section 7); `build`/`build-pg` additionally
+reject a projected node count above `i32::MAX`, but only under `--num-nodes
+node-map`, where the count is predictable from the input. `sort-edges` and
+`compress` run no size preflight at all.
 
-```
-pgraph split finalBCUTXO_2022 --i-know-this-is-big --max-input-bytes 200GiB
-```
-
-That guard is deliberate: it lets `chunks/chunk_01.txt` (976 KB) through while
-making a many-hour run impossible to start by a typo.
+`--dry-run` (see the quick start below) prints the resolved plan, the input
+sizes and those estimates for any stage without touching anything; run it first
+when the input is large.
 
 ---
 
@@ -109,7 +111,7 @@ Every one of these is **unreachable on the current corpus** (verified over
 | ids `long`, output slots reported as `Nodes:` (line 64) | `u64` everywhere; both numbers under `--stats extended`, Java's number under `--stats java` | 2.2e9 nodes at N=28, above `i32::MAX` |
 | `builder.sh` materialises a 135 GB temp file | `ChunkChain` streams the chunks | pure waste, plus an orphan `combined_chunks_XXXXXX.txt` in the project directory after a crash |
 | a non-UTF-8 byte decodes to U+FFFD and is never reported (`InputStreamReader`, line 41) | `--lenient` does exactly that and tallies it; the default reports the line and the byte offset | the corpus is pure ASCII (`chunk_01`: 0 bytes >= 0x80), and either way a stray byte no longer kills a 132 GB pass with a message that names no line |
-| `HashMap<Long,Long>` accepts any txId sequence | the default `--node-map-kind dense` requires txIds to be consecutive from the first one, and refuses with `NonDenseTxId` otherwise | **verified safe for this corpus**: txIds run consecutively `0..778_613_437` across all 28 chunks, every boundary contiguous. It is fail-fast with an actionable remedy (`--node-map-kind hash` is a literal port of the Java map and reproduces its output exactly), never a silent divergence. A future re-ingest producing sparse txIds is not a Rust bug — use `hash`. |
+| `HashMap<Long,Long>` accepts any txId sequence | the single node map is a prefix-sum `Vec<u64>` indexed by txId. A txId that jumps **forward** is `NonDenseTxId` (bridged with zero-output placeholders under `--lenient`, up to 2^20 ids). A txId that goes **backwards** is not an error: it is a repeat, and the ids of its first occurrence come back, exactly as Java's `getOrCreateId` did. | **required for this corpus, not merely safe**: txIds run consecutively `0..778_613_437` across all 28 chunks, but `chunk_04` re-emits txId 142726 and txId 142572 — the BIP-30 duplicate coinbase transactions of blocks 91812/91842 and 91722/91880, permanent consensus history. Refusing them would refuse the real data; a second, hash-backed node map behind a flag used to be the workaround and has been deleted. `tests/data/bip30/c04anomaly.txt` is the regression, and `test_node_map_matches_the_java_oracle_on_chunk01` diffs the id assignment against a transcription of `getOrCreateId` over all of `chunk_01`. |
 
 `--strict --on-missing-source fail --stats java` (the defaults) is the
 bug-for-bug reference mode, modulo the fixes above.
@@ -278,7 +280,39 @@ input size and **refuses to start** rather than filling the volume.
 * **`--log-dir` really is a log directory.** Everything that goes to stderr is
   teed into `<log-dir>/<stage>.log`, and the two Java statistics lines (which
   go to stdout, byte-for-byte) are echoed there too, so a finished run leaves
-  the artefacts `build_pg.sh` used to leave in `logs/`.
+  the artefacts `build_pg.sh` used to leave in `logs/`. Because the tee makes
+  the sink a pipe, **colour is disabled** (`WriteStyle::Never` next to
+  `Target::Pipe`): the log file can never pick up ANSI escapes, and neither can
+  stderr while the tee is active.
+* **The log line format is webgraph-rs's**, so a `pgraph` stage and a
+  `webgraph` stage in the same pipeline read alike:
+
+  ```text
+  <utc ts> <elapsed> <LEVEL> [<ThreadId>] <target> - <message>
+  2026-09-17 10:58:38.895 14ms INFO [ThreadId(1)] pgraph - threads=112 …
+  ```
+
+  The timestamp is UTC (`jiff::Timestamp::strftime`, which is the same instant
+  `env_logger` used to print with a trailing `Z`); the second field is the time
+  elapsed since the logger was installed.
+* **`--log-interval` (global, default `10s`)** sets how often the long loops
+  report. Suffixes `s`/`m`/`h`/`d`, and a bare number is **milliseconds**, for
+  compatibility with the Java pipeline: `--log-interval 1d2h3m4s567` parses.
+  Every large loop — split, edge-list build, node-map write, arc read, arc
+  sort, counting merge, edge-list write, arc scan, BVGraph compression — is
+  driven by a `dsi-progress-logger`, which prints a count, a rate, resident
+  memory and, where the total is known exactly, a percentage and an ETA.
+* **`RUST_LOG` layers on top of `-v`/`-vv`, it does not replace it.** The
+  builder is `filter_level(level).parse_default_env()`, which installs a
+  catch-all directive first, so `RUST_LOG=utxo2webgraph::arcs=debug` raises
+  that one module and leaves everything else at the `-v` level. (Switching to
+  `Builder::from_env(..default_filter_or("info"))` would silence every target
+  `RUST_LOG` does not name and make `-vv` a no-op.) Targets are module paths:
+  `utxo2webgraph::arcs`, `utxo2webgraph::split`, `utxo2webgraph::compress`,
+  and `pgraph` for the binary. Note that a progress line carries the target of
+  the module that *built* the logger, which for the pipeline loops is `pgraph`
+  (`main.rs` owns them) and for the compressor's own loggers is
+  `utxo2webgraph::compress`.
 * **Spill directories are pid-keyed and reaped at startup.** A run killed by
   `SIGINT`/`SIGKILL` never runs `TempDir`'s destructor; the next `pgraph`
   removes any `tmp/pgraph-sort-<pid>-*` whose pid is no longer alive, and never
@@ -370,7 +404,8 @@ pgraph edge-list -i chunks/chunk_01.txt --arcs /dev/null ; echo $?  # 0
 ```
 
 `cargo test` runs all of the above as `tests/golden.rs`, plus the eight-case
-edge corpus in `$REF/edge/` and the dense-versus-hash node-map cross-check.
+edge corpus in `$REF/edge/`, the node-map cross-check against a transcription of
+Java's `getOrCreateId`, and the BIP-30 duplicate-coinbase regression.
 
 ---
 
@@ -405,9 +440,13 @@ edge corpus in `$REF/edge/` and the dense-versus-hash node-map cross-check.
    directory, so no `.class` file lands next to the original sources.
 3. **Never run the pipeline on anything larger than `chunk_01.txt` (976 KB)**
    without a deliberate decision. `chunk_05.txt` (84 MB) is acceptable for a
-   correctness cross-check, but not for timing claims. The full
-   `finalBCUTXO_2022` is 135 GB and is guarded in code behind
-   `--i-know-this-is-big`.
+   correctness cross-check, but not for timing claims; the full
+   `finalBCUTXO_2022` is 135 GB. This is a contributor convention and nothing
+   more: no code enforces it, the 84 MB boundary has no successor in the
+   binary, and `pgraph` will start whatever you point it at. The only
+   automatic brakes are the disk-space and node-count preflights of section 7,
+   which stop a run that cannot finish rather than one that is merely large.
+   Run `--dry-run` first and read the plan.
 4. **Keep the `webgraph` dependency pinned to a rev.** Bumping it is fine, but
    re-run the differential suite in section 10 in the same commit: the pin is
    what keeps the compressed output reproducible.

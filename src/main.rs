@@ -1,10 +1,11 @@
 //! `pgraph` binary. A Rust port of the Bitcoin Payment Graph pipeline by
 //! **Matteo Loporchio**.
 //!
-//! This file is dispatch and orchestration only: logger and thread-pool setup,
-//! the disk/space/limit preflight, and the fused pipelines that `build_pg.sh`
-//! and `builder.sh` used to drive with `java` and GNU `sort`. All of the
-//! algorithm lives in the library.
+//! This file is dispatch and orchestration only: thread-pool setup, the
+//! disk-space and node-count preflight, and the fused pipelines that
+//! `build_pg.sh` and `builder.sh` used to drive with `java` and GNU `sort`.
+//! Logger setup lives next door in [`logging`]; all of the algorithm lives in
+//! the library.
 //!
 //! It is the only file in the crate that may use `anyhow`: the library returns
 //! typed `PgError`s so that `--lenient` and `--on-missing-source` can *match*
@@ -19,6 +20,7 @@ use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
+use dsi_progress_logger::prelude::*;
 use log::{debug, info, warn};
 
 use utxo2webgraph::arcs::{
@@ -30,11 +32,13 @@ use utxo2webgraph::cli::{
 };
 use utxo2webgraph::compress::{self, CompressOpts};
 use utxo2webgraph::edge_list::{self, EdgeListOpts};
-use utxo2webgraph::nodemap::new_node_map;
+use utxo2webgraph::nodemap::DenseNodeMap;
 use utxo2webgraph::split::{self, ChunkChain, SplitOpts};
 use utxo2webgraph::{
     free_space_bytes, take_iter_error, total_memory_bytes, ArcCodec, ArcSink, NodeId,
 };
+
+mod logging;
 
 /// The `BufReader` size used for every transaction-list read. Shared with the
 /// library so the `split` stage and the edge-list stage agree.
@@ -55,9 +59,6 @@ const EL_BYTES_PER_BYTE: f64 = 1.55;
 
 /// Bytes of text node map produced per input byte.
 const NM_BYTES_PER_BYTE: f64 = 0.41;
-
-/// The master transaction list, which must never be processed by accident.
-const MASTER_LIST_NAME: &str = "finalBCUTXO_2022";
 
 /// The three files `BVGraph.store` writes, plus the optional Elias-Fano index.
 ///
@@ -93,7 +94,7 @@ fn run() -> Result<()> {
     //    produced (`logs/pg_el_builder.log`, `logs/webgraph_builder.err`) and
     //    what the directory is created for.
     let stage = stage_name(&cli.command);
-    init_logger(common.verbose, &common.log_dir, stage);
+    logging::init(common.verbose, &common.log_dir, stage);
 
     // 3. TMPDIR, before any thread exists. NON-NEGOTIABLE: webgraph's external
     //    sort calls bare `tempfile::tempdir()` and ignores
@@ -157,63 +158,6 @@ fn stage_name(c: &Command) -> &'static str {
         Command::Compress(_) => "compress",
         Command::BuildPg(_) => "build-pg",
         Command::Build(_) => "build",
-    }
-}
-
-/// A `Write` that forwards to stderr and, when one could be opened, to
-/// `<log-dir>/<stage>.log` as well.
-///
-/// `--log-dir` used to be created and then never written to, which both
-/// implied a contract the binary did not honour and lost the artefacts
-/// `build_pg.sh` left in `logs/`. Failing to open or write the file is never
-/// fatal: the log is a convenience, the run is not.
-struct TeeWriter {
-    file: Option<File>,
-}
-
-impl Write for TeeWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if let Some(f) = self.file.as_mut() {
-            let _ = f.write_all(buf);
-        }
-        std::io::stderr().write(buf)
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        if let Some(f) = self.file.as_mut() {
-            let _ = f.flush();
-        }
-        std::io::stderr().flush()
-    }
-}
-
-/// Installs `env_logger` on stderr, teed into `<log_dir>/<stage>.log`.
-/// `RUST_LOG` still overrides `-v`.
-fn init_logger(verbose: u8, log_dir: &Path, stage: &str) {
-    let level = match verbose {
-        0 => log::LevelFilter::Info,
-        1 => log::LevelFilter::Debug,
-        _ => log::LevelFilter::Trace,
-    };
-    // The directory is created in step 5, after this; do it here too so the
-    // very first log line already lands in the file.
-    let _ = fs::create_dir_all(log_dir);
-    let path = log_dir.join(format!("{stage}.log"));
-    let file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .ok();
-    let have_file = file.is_some();
-    let _ = env_logger::Builder::new()
-        .filter_level(level)
-        .parse_default_env()
-        .format_timestamp_millis()
-        .target(env_logger::Target::Pipe(Box::new(TeeWriter { file })))
-        .try_init();
-    if have_file {
-        debug!("logging to stderr and {}", path.display());
-    } else {
-        warn!("could not open {} for logging; stderr only", path.display());
     }
 }
 
@@ -320,43 +264,18 @@ fn resolve_inputs(sel: &InputSelector, chunks: Option<usize>) -> Result<Vec<Path
     Ok(paths)
 }
 
-/// HARD RULE: refuse to run on `finalBCUTXO_2022`, or on anything above
-/// `--max-input-bytes`, without `--i-know-this-is-big`.
+/// Stat every resolved input and return their total size in bytes.
 ///
-/// The default threshold (16 MiB) lets `chunks/chunk_01.txt` (976 KB) through
-/// and stops a 135 GB, many-hour run from being started by a typo.
-/// Returns the total input size in bytes.
-fn guard_inputs(paths: &[PathBuf], c: &CommonOpts) -> Result<u64> {
+/// A pure probe: it writes nothing, logs nothing and refuses nothing. The
+/// total is load-bearing downstream — it feeds `estimate`, the `require_space`
+/// disk preflight, `guard_projected_node_count` and every `--dry-run` plan.
+fn measure_inputs(paths: &[PathBuf]) -> Result<u64> {
     let mut total = 0u64;
     for p in paths {
         let len = fs::metadata(p)
             .with_context(|| format!("could not stat {}", p.display()))?
             .len();
-        if p.file_name()
-            .map(|n| n == MASTER_LIST_NAME)
-            .unwrap_or(false)
-            && !c.i_know_this_is_big
-        {
-            bail!(
-                "refusing to process the master transaction list {} ({}); \
-                 it is {} and would take hours. Pass --i-know-this-is-big \
-                 (and raise --max-input-bytes) if that is really what you want.",
-                p.display(),
-                MASTER_LIST_NAME,
-                human_bytes(len)
-            );
-        }
         total = total.saturating_add(len);
-    }
-    if total > c.max_input_bytes && !c.i_know_this_is_big {
-        bail!(
-            "input is {} across {} file(s), above the --max-input-bytes limit of {}; \
-             pass --i-know-this-is-big, or raise the limit \
-             (e.g. --max-input-bytes 128MiB for chunks/chunk_05.txt)",
-            human_bytes(total),
-            paths.len(),
-            human_bytes(c.max_input_bytes)
-        );
     }
     Ok(total)
 }
@@ -643,7 +562,7 @@ fn cmd_split(common: &CommonOpts, a: &SplitArgs) -> Result<()> {
     );
 
     let inputs = vec![a.input.clone()];
-    let input_bytes = guard_inputs(&inputs, common)?;
+    let input_bytes = measure_inputs(&inputs)?;
     note_output_location("chunks", &a.output_dir);
 
     if common.dry_run {
@@ -673,7 +592,8 @@ fn cmd_split(common: &CommonOpts, a: &SplitArgs) -> Result<()> {
     let reader = BufReader::with_capacity(READ_BUFFER, file);
 
     let started = Instant::now();
-    let stats = split::split(reader, &a.output_dir, &opts)?;
+    let mut pl = progress_logger![display_memory = true, log_interval = common.log_interval];
+    let stats = split::split(reader, &a.output_dir, &opts, &mut pl)?;
 
     info!(
         "split done in {:?}: {} records written, {} dropped before --start",
@@ -711,7 +631,7 @@ fn cmd_split(common: &CommonOpts, a: &SplitArgs) -> Result<()> {
 
 fn cmd_edge_list(common: &CommonOpts, a: &EdgeListArgs) -> Result<()> {
     let paths = resolve_inputs(&a.inputs, a.chunks)?;
-    let input_bytes = guard_inputs(&paths, common)?;
+    let input_bytes = measure_inputs(&paths)?;
     let codec: ArcCodec = a.arc_codec.into();
     let est = estimate(input_bytes, codec);
 
@@ -742,7 +662,7 @@ fn cmd_edge_list(common: &CommonOpts, a: &EdgeListArgs) -> Result<()> {
         require_space(nm, est.node_map_bytes, "the node map")?;
     }
 
-    let mut node_map = new_node_map(a.node_map_kind.into(), common.mode(), a.max_tx_id);
+    let mut node_map = DenseNodeMap::sized(common.mode(), a.max_tx_id);
 
     // The sinks are themselves atomic (`arcs::AtomicOut`: sibling temp file,
     // fsync where it means anything, rename on success, unlink on failure), so
@@ -767,7 +687,8 @@ fn cmd_edge_list(common: &CommonOpts, a: &EdgeListArgs) -> Result<()> {
     // node-map write in the final elapsed time (line 95). Same here.
     let started = Instant::now();
     let reader = BufReader::with_capacity(READ_BUFFER, ChunkChain::new(paths)?);
-    let mut stats = edge_list::build_edge_list(reader, &mut *node_map, &mut *sink, opts)?;
+    let mut pl = progress_logger![display_memory = true, log_interval = common.log_interval];
+    let mut stats = edge_list::build_edge_list(reader, &mut node_map, &mut *sink, opts, &mut pl)?;
     drop(sink);
 
     if let Some(nm_path) = &a.node_map {
@@ -776,7 +697,8 @@ fn cmd_edge_list(common: &CommonOpts, a: &EdgeListArgs) -> Result<()> {
         let phase = Instant::now();
         info!("writing the node map to {}", nm_path.display());
         let nm_out = AtomicOut::new(nm_path)?;
-        let written = edge_list::write_node_map(&*node_map, nm_out.path())?;
+        let mut pl = progress_logger![display_memory = true, log_interval = common.log_interval];
+        let written = edge_list::write_node_map(&node_map, nm_out.path(), &mut pl)?;
         nm_out.commit()?;
         info!(
             "node map written in {:?}: {} rows, {}",
@@ -826,11 +748,20 @@ fn report_edge_list_stats(s: &edge_list::EdgeListStats) {
             s.zero_output_txs
         );
     }
-    if s.distinct_nodes != s.node_slots {
+    if s.distinct_nodes < s.node_slots {
         warn!(
             "`Nodes:` reports {} output slots, but only {} distinct nodes exist; \
              Java's counter (line 64) counts slots, so a repeated txId overcounts",
             s.node_slots, s.distinct_nodes
+        );
+    } else if s.distinct_nodes > s.node_slots {
+        warn!(
+            "`Nodes:` reports {} output slots, but {} distinct nodes exist; the \
+             extra {} were minted by --on-missing-source create and are not outputs \
+             of any transaction in this input",
+            s.node_slots,
+            s.distinct_nodes,
+            s.distinct_nodes - s.node_slots
         );
     }
 }
@@ -842,7 +773,7 @@ fn cmd_sort_edges(common: &CommonOpts, a: &SortEdgesArgs) -> Result<()> {
         bail!("nothing to do: pass --edge-list FILE and/or --sorted-arcs FILE");
     }
     let inputs = vec![a.input.clone()];
-    let input_bytes = guard_inputs(&inputs, common)?;
+    let input_bytes = measure_inputs(&inputs)?;
     let threads = resolve_threads(common);
     let memory = resolve_memory(common);
     let codec: ArcCodec = a.arc_codec.into();
@@ -887,19 +818,20 @@ fn cmd_sort_edges(common: &CommonOpts, a: &SortEdgesArgs) -> Result<()> {
         arcs_per_run(memory, codec)
     );
 
-    let (sorted, stats) = sort_arc_file(&a.input, a.input_format, codec, opts)?;
+    let mut pl = progress_logger![display_memory = true, log_interval = common.log_interval];
+    let (sorted, stats) = sort_arc_file(&a.input, a.input_format, codec, opts, &mut pl)?;
     report_sort_stats(&stats);
 
     // `write_tsv`/`write_binary` go through `arcs::AtomicOut`, which already
     // writes to a sibling temp file and renames on success.
     if let Some(p) = &a.edge_list {
         create_parent(p)?;
-        let n = sorted.write_tsv(p)?;
+        let n = sorted.write_tsv(p, &mut pl)?;
         info!("wrote {n} arcs to {}", p.display());
     }
     if let Some(p) = &a.sorted_arcs {
         create_parent(p)?;
-        let n = sorted.write_binary(p)?;
+        let n = sorted.write_binary(p, &mut pl)?;
         info!("wrote {n} arcs to {}", p.display());
     }
     Ok(())
@@ -911,14 +843,18 @@ fn sort_arc_file(
     format: InputFormatArg,
     codec: ArcCodec,
     opts: SortOpts,
+    pl: &mut impl ProgressLog,
 ) -> Result<(SortedArcs, SortStats)> {
     let resolved = resolve_format(path, format, codec)?;
     let mut sorter = ArcSorter::new(opts)?;
+    pl.item_name("arc");
+    pl.start(format!("Reading the arcs of {}...", path.display()));
     match resolved {
         ArcFileFormat::Tsv => {
             let (iter, slot) = utxo2webgraph::arcs::read_tsv_arcs(path)?;
             for (src, dst) in iter {
                 sorter.push(src as NodeId, dst as NodeId)?;
+                pl.light_update();
             }
             take_iter_error(&slot)?;
         }
@@ -926,12 +862,14 @@ fn sort_arc_file(
             let (iter, slot) = utxo2webgraph::arcs::read_binary_arcs(path, c)?;
             for (src, dst) in iter {
                 sorter.push(src as NodeId, dst as NodeId)?;
+                pl.light_update();
             }
             take_iter_error(&slot)?;
         }
     }
+    pl.done();
     sorter.finish()?;
-    Ok(sorter.into_sorted()?)
+    Ok(sorter.into_sorted(pl)?)
 }
 
 /// Resolves `--input-format`, sniffing the file when it says `auto`.
@@ -974,7 +912,7 @@ fn report_sort_stats(s: &SortStats) {
 fn cmd_compress(common: &CommonOpts, a: &CompressArgs) -> Result<()> {
     compress::sanitize_basename(&a.output_prefix)?;
     let inputs = vec![a.input.clone()];
-    let input_bytes = guard_inputs(&inputs, common)?;
+    let input_bytes = measure_inputs(&inputs)?;
     let threads = resolve_threads(common);
     let memory = resolve_memory(common);
     let codec: ArcCodec = a.arc_codec.into();
@@ -1002,8 +940,7 @@ fn cmd_compress(common: &CommonOpts, a: &CompressArgs) -> Result<()> {
     // Pass 1: count the arcs and find the largest endpoint. `compress_*_iter`
     // needs the arc count, and `--num-nodes from-arcs` needs `max + 1`.
     let phase = Instant::now();
-    info!("scanning {} to count the arcs", a.input.display());
-    let (num_arcs, max_node_id) = scan_arcs(&a.input, format)?;
+    let (num_arcs, max_node_id) = scan_arcs(&a.input, format, common.log_interval)?;
     info!(
         "edge list: {num_arcs} arcs, max node id {max_node_id} (scanned in {:?})",
         phase.elapsed()
@@ -1031,6 +968,7 @@ fn cmd_compress(common: &CommonOpts, a: &CompressArgs) -> Result<()> {
         build_ef: a.build_ef,
         allow_empty: a.allow_empty,
         verify: a.verify.into(),
+        log_interval: common.log_interval,
     };
 
     // Pass 2: stream the sorted arcs straight into the compressor. No
@@ -1074,18 +1012,37 @@ fn cmd_compress(common: &CommonOpts, a: &CompressArgs) -> Result<()> {
 }
 
 /// Counts the arcs and finds the largest endpoint in one streaming pass.
-fn scan_arcs(path: &Path, format: ArcFileFormat) -> Result<(u64, NodeId)> {
+///
+/// 195 GiB of text at `N = 28`: a silent nine-minute phase without a progress
+/// logger. A fixed-width binary file has an exact arc count in its length, so
+/// that case gets a percentage and an ETA; a TSV's line count does not exist
+/// until it has been read, so that case reports a rate and a running total.
+fn scan_arcs(
+    path: &Path,
+    format: ArcFileFormat,
+    log_interval: std::time::Duration,
+) -> Result<(u64, NodeId)> {
     let mut count = 0u64;
     let mut max = 0u64;
-    // 195 GiB of text at N=28: a silent nine-minute phase without this.
-    let mut progress = utxo2webgraph::arcs::ArcProgress::new("scan", path);
+    let mut pl = progress_logger![
+        item_name = "arc",
+        display_memory = true,
+        log_interval = log_interval
+    ];
+    if let ArcFileFormat::Binary(c) = format {
+        let len = fs::metadata(path)
+            .with_context(|| format!("could not stat {}", path.display()))?
+            .len();
+        pl.expected_updates(Some((len / c.record_size() as u64) as usize));
+    }
+    pl.start(format!("Scanning {} to count the arcs...", path.display()));
     match format {
         ArcFileFormat::Tsv => {
             let (iter, slot) = utxo2webgraph::arcs::read_tsv_arcs(path)?;
             for (src, dst) in iter {
                 count += 1;
                 max = max.max(src as u64).max(dst as u64);
-                progress.tick();
+                pl.light_update();
             }
             take_iter_error(&slot)?;
         }
@@ -1094,12 +1051,12 @@ fn scan_arcs(path: &Path, format: ArcFileFormat) -> Result<(u64, NodeId)> {
             for (src, dst) in iter {
                 count += 1;
                 max = max.max(src as u64).max(dst as u64);
-                progress.tick();
+                pl.light_update();
             }
             take_iter_error(&slot)?;
         }
     }
-    progress.done(count);
+    pl.done_with_count(count as usize);
     Ok((count, max))
 }
 
@@ -1201,7 +1158,7 @@ fn node_map_next_id(path: &Path) -> Result<usize> {
 fn cmd_build_pg(common: &CommonOpts, a: &BuildPgArgs) -> Result<()> {
     compress::sanitize_basename(&a.output_prefix)?;
     let paths = resolve_inputs(&a.inputs, a.chunks)?;
-    let input_bytes = guard_inputs(&paths, common)?;
+    let input_bytes = measure_inputs(&paths)?;
     let threads = resolve_threads(common);
     let memory = resolve_memory(common);
     let codec: ArcCodec = a.arc_codec.into();
@@ -1286,7 +1243,7 @@ fn cmd_build_pg(common: &CommonOpts, a: &BuildPgArgs) -> Result<()> {
         est.arcs
     );
 
-    let mut node_map = new_node_map(a.node_map_kind.into(), common.mode(), a.max_tx_id);
+    let mut node_map = DenseNodeMap::sized(common.mode(), a.max_tx_id);
     let mut sorter = ArcSorter::new(sort_opts)?;
 
     let el_opts = EdgeListOpts {
@@ -1299,7 +1256,9 @@ fn cmd_build_pg(common: &CommonOpts, a: &BuildPgArgs) -> Result<()> {
 
     let started = Instant::now();
     let reader = BufReader::with_capacity(READ_BUFFER, ChunkChain::new(paths)?);
-    let mut stats = edge_list::build_edge_list(reader, &mut *node_map, &mut sorter, el_opts)?;
+    let mut pl = progress_logger![display_memory = true, log_interval = common.log_interval];
+    let mut stats =
+        edge_list::build_edge_list(reader, &mut node_map, &mut sorter, el_opts, &mut pl)?;
 
     if !a.no_node_map {
         let phase = Instant::now();
@@ -1309,7 +1268,7 @@ fn cmd_build_pg(common: &CommonOpts, a: &BuildPgArgs) -> Result<()> {
             a.node_map.display()
         );
         let out = AtomicOut::new(&a.node_map)?;
-        let bytes = edge_list::write_node_map(&*node_map, out.path())?;
+        let bytes = edge_list::write_node_map(&node_map, out.path(), &mut pl)?;
         out.commit()?;
         info!(
             "node map written in {:?}: {}",
@@ -1330,7 +1289,7 @@ fn cmd_build_pg(common: &CommonOpts, a: &BuildPgArgs) -> Result<()> {
 
     let phase = Instant::now();
     info!("sorting {} raw arcs", stats.edge_count);
-    let (sorted, sort_stats) = sorter.into_sorted()?;
+    let (sorted, sort_stats) = sorter.into_sorted(&mut pl)?;
     info!("sort finished in {:?}", phase.elapsed());
     report_sort_stats(&sort_stats);
 
@@ -1339,7 +1298,7 @@ fn cmd_build_pg(common: &CommonOpts, a: &BuildPgArgs) -> Result<()> {
         let phase = Instant::now();
         info!("writing the text edge list to {}", a.edge_list.display());
         create_parent(&a.edge_list)?;
-        let n = sorted.write_tsv(&a.edge_list)?;
+        let n = sorted.write_tsv(&a.edge_list, &mut pl)?;
         info!(
             "wrote {n} sorted arcs to {} in {:?}",
             a.edge_list.display(),
@@ -1348,7 +1307,7 @@ fn cmd_build_pg(common: &CommonOpts, a: &BuildPgArgs) -> Result<()> {
     }
     if common.keep_intermediate {
         let path = kept_arcs_path(&common.tmp_dir, &a.output_prefix);
-        let n = sorted.write_binary(&path)?;
+        let n = sorted.write_binary(&path, &mut pl)?;
         info!("kept {n} sorted binary arcs at {}", path.display());
     }
 
@@ -1380,6 +1339,7 @@ fn cmd_build_pg(common: &CommonOpts, a: &BuildPgArgs) -> Result<()> {
         build_ef: false,
         allow_empty: a.allow_empty,
         verify: a.verify.into(),
+        log_interval: common.log_interval,
     };
     compress_and_commit(&sorted, &a.output_prefix, &comp_opts)?;
     info!("build-pg completed in {:?}", started.elapsed());
@@ -1464,7 +1424,6 @@ fn cmd_build(common: &CommonOpts, a: &BuildArgs) -> Result<()> {
                 no_node_map: a.no_node_map,
                 sort_algo: a.sort_algo,
                 arc_codec: a.arc_codec,
-                node_map_kind: a.node_map_kind,
                 max_tx_id: a.max_tx_id,
                 on_missing_source: a.on_missing_source,
                 num_nodes: a.num_nodes,

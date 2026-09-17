@@ -58,6 +58,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use dsi_bitstream::prelude::BE;
 use dsi_progress_logger::prelude::*;
@@ -101,6 +102,13 @@ pub struct CompressOpts {
     pub allow_empty: bool,
     /// How thoroughly [`verify_graph`] re-reads the graph it just wrote.
     pub verify: VerifyLevel,
+    /// How often the compressor's progress loggers report.
+    ///
+    /// This is the one place in the crate where the interval is carried in an
+    /// options struct rather than threaded as a `&mut impl ProgressLog`. The
+    /// loggers below are handed to webgraph's compressor and external sort,
+    /// which own their lifecycle, so there is no loop here to take a logger.
+    pub log_interval: Duration,
 }
 
 /// How much of the finished graph [`verify_graph`] reads back.
@@ -132,6 +140,7 @@ impl Default for CompressOpts {
             build_ef: false,
             allow_empty: false,
             verify: VerifyLevel::default(),
+            log_interval: Duration::from_secs(10),
         }
     }
 }
@@ -377,7 +386,15 @@ where
         validated.map(|p| (p, ())),
     ));
 
-    let mut pl = progress_logger![display_memory = true, item_name = "node"];
+    // `item_name` is inert: webgraph's compressor sets its own `item_name` and
+    // `expected_updates` (comp/impls.rs), which is why upstream's
+    // `cli/src/to/bvgraph.rs` passes only `display_memory` and `log_interval`.
+    // Kept so the intent is readable if webgraph ever stops overriding it.
+    let mut pl = progress_logger![
+        display_memory = true,
+        item_name = "node",
+        log_interval = opts.log_interval
+    ];
     let conf = BvCompConf::new(basename)
         // Redundant — this is what `BvCompConf::new` already installs — but it
         // is the line that documents "same parameters as the Java BVGraph".
@@ -495,7 +512,12 @@ where
 
     let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
         pool.install(move || -> PgResult<u64> {
-            let mut pls = progress_logger![display_memory = true, item_name = "arc"];
+            // `item_name` inert here too: `par_sort_pairs` sets it to "pair".
+            let mut pls = progress_logger![
+                display_memory = true,
+                item_name = "arc",
+                log_interval = opts.log_interval
+            ];
             let sorted = ParSortedGraph::config()
                 .dedup()
                 .memory_usage(MemoryUsage::MemorySize(opts.memory_bytes as usize))
@@ -503,7 +525,11 @@ where
                 .sort_pairs(opts.num_nodes, arcs)
                 .map_err(|e| PgError::other(format!("could not sort the arcs: {e:#}")))?;
 
-            let mut plc = progress_logger![display_memory = true, item_name = "node"];
+            let mut plc = progress_logger![
+                display_memory = true,
+                item_name = "node",
+                log_interval = opts.log_interval
+            ];
             let conf = BvCompConf::new(basename)
                 .comp_flags(CompFlags::default())
                 .tmp_dir(&opts.tmp_dir);

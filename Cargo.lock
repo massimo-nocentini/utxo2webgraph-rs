@@ -1869,6 +1869,7 @@ dependencies = [
  "dsi-progress-logger",
  "env_logger",
  "itoa",
+ "jiff",
  "lender",
  "log",
  "rayon",

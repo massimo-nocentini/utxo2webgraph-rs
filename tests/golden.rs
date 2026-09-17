@@ -21,6 +21,7 @@ use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
 use dsi_bitstream::prelude::BE;
+use dsi_progress_logger::prelude::*;
 use lender::for_;
 use webgraph::graphs::bvgraph::BvGraphSeq;
 use webgraph::prelude::*;
@@ -28,9 +29,9 @@ use webgraph::prelude::*;
 use utxo2webgraph::arcs::{ArcSorter, NullArcSink, SortOpts, TsvArcSink};
 use utxo2webgraph::compress::{self, CompressOpts, VerifyLevel};
 use utxo2webgraph::edge_list::{build_edge_list, write_node_map, EdgeListOpts, EdgeListStats};
-use utxo2webgraph::nodemap::{new_node_map, NodeMap};
+use utxo2webgraph::nodemap::DenseNodeMap;
 use utxo2webgraph::{
-    ArcCodec, ArcSink, Mode, NodeId, NodeMapKind, OnMissingSource, PgError, SortAlgo, StatsStyle,
+    ArcCodec, ArcSink, Mode, NodeId, OnMissingSource, PgError, SortAlgo, StatsStyle,
 };
 
 const CHUNK_01: &str = "/data/bitcoin/2022/utxo-spllitting-pipeline/chunks/chunk_01.txt";
@@ -208,7 +209,6 @@ fn default_opts(mode: Mode, on_missing: OnMissingSource) -> EdgeListOpts {
 fn run_builder(
     input: &Path,
     dir: &Path,
-    kind: NodeMapKind,
     mode: Mode,
     on_missing: OnMissingSource,
     tag: &str,
@@ -216,19 +216,20 @@ fn run_builder(
     let arcs_path = dir.join(format!("{tag}_el.tsv"));
     let nm_path = dir.join(format!("{tag}_nm.tsv"));
 
-    let mut node_map = new_node_map(kind, mode, None);
+    let mut node_map = DenseNodeMap::new(mode);
     let mut sink = TsvArcSink::create(&arcs_path).expect("create arc sink");
     let reader = BufReader::new(fs::File::open(input).expect("open input"));
     let stats = build_edge_list(
         reader,
-        &mut *node_map,
+        &mut node_map,
         &mut sink,
         default_opts(mode, on_missing),
+        no_logging!(),
     )
     .expect("build_edge_list");
     drop(sink);
 
-    write_node_map(&*node_map, &nm_path).expect("write node map");
+    write_node_map(&node_map, &nm_path, no_logging!()).expect("write node map");
     (
         stats,
         fs::read(&arcs_path).expect("read arcs"),
@@ -300,7 +301,6 @@ fn test_chunk01_edge_list_byte_identical() {
     let (stats, arcs, node_map) = run_builder(
         Path::new(CHUNK_01),
         dir.path(),
-        NodeMapKind::Dense,
         Mode::Strict,
         OnMissingSource::Fail,
         "c1",
@@ -379,14 +379,8 @@ fn test_chunk01_plus_02() {
     // In-tree fixture: `javaref` asserts it exists.
     let c12 = javaref("c12.txt");
     let dir = tempfile::tempdir().expect("tempdir");
-    let (stats, arcs, node_map) = run_builder(
-        &c12,
-        dir.path(),
-        NodeMapKind::Dense,
-        Mode::Strict,
-        OnMissingSource::Fail,
-        "c12",
-    );
+    let (stats, arcs, node_map) =
+        run_builder(&c12, dir.path(), Mode::Strict, OnMissingSource::Fail, "c12");
 
     // Java: `Processed: 32705 transactions` / `Nodes: 32777  Edges: 3628`.
     assert_eq!(stats.tx_count, 32705);
@@ -432,14 +426,15 @@ fn test_chunk02_alone_fails() {
     // at PaymentGraphEdgeListBuilder.java:74, leaving BOTH output files 0
     // bytes (the node map is written only after the read loop). 134 of the
     // chunk's 1854 input references are dangling.
-    let mut node_map = new_node_map(NodeMapKind::Dense, Mode::Strict, None);
+    let mut node_map = DenseNodeMap::new(Mode::Strict);
     let mut sink = NullArcSink::new();
     let reader = BufReader::new(fs::File::open(CHUNK_02).expect("open chunk_02"));
     let err = build_edge_list(
         reader,
-        &mut *node_map,
+        &mut node_map,
         &mut sink,
         default_opts(Mode::Strict, OnMissingSource::Fail),
+        no_logging!(),
     )
     .expect_err("chunk_02 alone must fail, exactly as the Java NPE did");
     match err {
@@ -459,14 +454,15 @@ fn test_chunk02_alone_fails() {
     }
 
     // With `skip`, the same input succeeds and tallies every dangling ref.
-    let mut node_map = new_node_map(NodeMapKind::Dense, Mode::Lenient, None);
+    let mut node_map = DenseNodeMap::new(Mode::Lenient);
     let mut sink = NullArcSink::new();
     let reader = BufReader::new(fs::File::open(CHUNK_02).expect("open chunk_02"));
     let stats = build_edge_list(
         reader,
-        &mut *node_map,
+        &mut node_map,
         &mut sink,
         default_opts(Mode::Lenient, OnMissingSource::Skip),
+        no_logging!(),
     )
     .expect("--on-missing-source skip must succeed");
     assert_eq!(
@@ -486,18 +482,19 @@ fn run_edge_case(tag: &str, dir: &Path, mode: Mode) -> Option<(EdgeListStats, Ve
     }
     let arcs_path = dir.join(format!("{tag}_el.tsv"));
     let nm_path = dir.join(format!("{tag}_nm.tsv"));
-    let mut node_map = new_node_map(NodeMapKind::Dense, mode, None);
+    let mut node_map = DenseNodeMap::new(mode);
     let mut sink = TsvArcSink::create(&arcs_path).expect("create sink");
     let reader = BufReader::new(fs::File::open(&input).expect("open case"));
     let stats = build_edge_list(
         reader,
-        &mut *node_map,
+        &mut node_map,
         &mut sink,
         default_opts(mode, OnMissingSource::Fail),
+        no_logging!(),
     )
     .unwrap_or_else(|e| panic!("edge case {tag} failed in {mode:?} mode: {e}"));
     drop(sink);
-    write_node_map(&*node_map, &nm_path).expect("write node map");
+    write_node_map(&node_map, &nm_path, no_logging!()).expect("write node map");
     Some((
         stats,
         fs::read(&arcs_path).unwrap(),
@@ -595,14 +592,15 @@ fn test_edge_case_corpus() {
     {
         let input = javaref("edge/t5.txt");
         if input.exists() {
-            let mut node_map = new_node_map(NodeMapKind::Dense, Mode::Strict, None);
+            let mut node_map = DenseNodeMap::new(Mode::Strict);
             let mut sink = NullArcSink::new();
             let reader = BufReader::new(fs::File::open(&input).unwrap());
             let err = build_edge_list(
                 reader,
-                &mut *node_map,
+                &mut node_map,
                 &mut sink,
                 default_opts(Mode::Strict, OnMissingSource::Fail),
+                no_logging!(),
             )
             .expect_err("t5 must fail in strict mode");
             assert!(
@@ -628,14 +626,15 @@ fn test_edge_case_corpus() {
     {
         let input = javaref("edge/t6.txt");
         if input.exists() {
-            let mut node_map = new_node_map(NodeMapKind::Dense, Mode::Strict, None);
+            let mut node_map = DenseNodeMap::new(Mode::Strict);
             let mut sink = NullArcSink::new();
             let reader = BufReader::new(fs::File::open(&input).unwrap());
             let err = build_edge_list(
                 reader,
-                &mut *node_map,
+                &mut node_map,
                 &mut sink,
                 default_opts(Mode::Strict, OnMissingSource::Fail),
+                no_logging!(),
             )
             .expect_err("t6 must fail in strict mode");
             assert!(
@@ -697,6 +696,7 @@ fn compress_opts(num_nodes: usize, tmp: &Path) -> CompressOpts {
         allow_empty: false,
         // The differential test recounts every arc on purpose.
         verify: VerifyLevel::Full,
+        log_interval: std::time::Duration::from_secs(10),
     }
 }
 
@@ -725,21 +725,22 @@ fn test_full_pipeline_chunk01() {
     let tmp = dir.path().join("tmp");
     fs::create_dir_all(&tmp).unwrap();
 
-    let mut node_map = new_node_map(NodeMapKind::Dense, Mode::Strict, None);
+    let mut node_map = DenseNodeMap::new(Mode::Strict);
     let mut sorter = ArcSorter::new(sort_opts(&tmp)).expect("ArcSorter");
     let reader = BufReader::new(fs::File::open(CHUNK_01).expect("open chunk_01"));
     let stats = build_edge_list(
         reader,
-        &mut *node_map,
+        &mut node_map,
         &mut sorter,
         default_opts(Mode::Strict, OnMissingSource::Fail),
+        no_logging!(),
     )
     .expect("build_edge_list");
     assert_eq!(stats.edge_count, 1094);
     let next_id = node_map.next_id();
     assert_eq!(next_id, 18620);
 
-    let (sorted, sort_stats) = sorter.into_sorted().expect("into_sorted");
+    let (sorted, sort_stats) = sorter.into_sorted(no_logging!()).expect("into_sorted");
     assert_eq!(sort_stats.raw_arcs, 1094);
     assert_eq!(
         sort_stats.duplicates_removed, 0,
@@ -750,7 +751,9 @@ fn test_full_pipeline_chunk01() {
 
     // The canonical `sort | uniq` artefact that `build_pg.sh` produced.
     let el_path = dir.path().join("pg_el.tsv");
-    let written = sorted.write_tsv(&el_path).expect("write_tsv");
+    let written = sorted
+        .write_tsv(&el_path, no_logging!())
+        .expect("write_tsv");
     assert_eq!(written, 1094);
     let el_bytes = fs::read(&el_path).unwrap();
     assert_eq!(
@@ -813,65 +816,256 @@ fn test_full_pipeline_chunk01() {
     );
 }
 
-// ---------------------------------------------------- dense vs hash node map
+// ------------------------------------ node map vs the Java getOrCreateId oracle
 
+/// Java's node map, transcribed from `PaymentGraphEdgeListBuilder.java:18-22`:
+///
+/// ```java
+/// public static long getOrCreateId(long key) {
+///     long id = nodes.getOrDefault(key, -1L);
+///     if (id == -1L) { id = nextId++; nodes.put(key, id); }
+///     return id;
+/// }
+/// ```
+///
+/// A repeated key keeps its original id and `nextId` does not move.
+#[derive(Default)]
+struct JavaOracle {
+    nodes: std::collections::HashMap<(i32, i32), u64>,
+    next_id: u64,
+}
+
+impl JavaOracle {
+    /// Java lines 59-65: one `getOrCreateId` per output slot, offsets ascending.
+    fn register(&mut self, tx: i32, num_outputs: u32) {
+        for offset in 0..num_outputs as i32 {
+            let next = &mut self.next_id;
+            self.nodes.entry((tx, offset)).or_insert_with(|| {
+                let id = *next;
+                *next += 1;
+                id
+            });
+        }
+    }
+
+    /// The same `txId\toffset\tid` rows the node map writes, sorted.
+    fn canonical(&self) -> (String, usize) {
+        let mut rows: Vec<(i32, i32, u64)> =
+            self.nodes.iter().map(|(&(t, o), &i)| (t, o, i)).collect();
+        rows.sort_unstable();
+        let mut out = String::new();
+        for (t, o, i) in &rows {
+            out.push_str(&format!("{t}\t{o}\t{i}\n"));
+        }
+        (out, rows.len())
+    }
+}
+
+/// Runs the Java oracle over every record of `input`, exactly as the reference
+/// implementation's read loop did.
+fn java_oracle_over(input: &Path) -> JavaOracle {
+    use std::io::BufRead;
+    let mut oracle = JavaOracle::default();
+    let reader = BufReader::new(fs::File::open(input).expect("open input"));
+    let opts = utxo2webgraph::record::ParseOpts { mode: Mode::Strict };
+    for (i, line) in reader.lines().enumerate() {
+        let line = line.expect("read line");
+        if let Some(rec) =
+            utxo2webgraph::record::parse_line(&line, i as u64 + 1, opts).expect("parse_line")
+        {
+            oracle.register(rec.tx_id, rec.num_outputs);
+        }
+    }
+    oracle
+}
+
+/// Was `test_dense_vs_hash_agree`, which drove the deleted hash-backed node
+/// map over the same input and diffed the two. That map is gone, so the
+/// counterpart is now the inline Java oracle above: the cross-check is still
+/// against the reference semantics, on real data, and it is now against the
+/// *actual* Java source rather than against a second Rust transcription of it.
 #[test]
-fn test_dense_vs_hash_agree() {
+fn test_node_map_matches_the_java_oracle_on_chunk01() {
     if !available(&[CHUNK_01]) {
         return;
     }
     let dir = tempfile::tempdir().expect("tempdir");
-    let (dense_stats, dense_arcs, dense_nm) = run_builder(
+    let (stats, _arcs, node_map) = run_builder(
         Path::new(CHUNK_01),
         dir.path(),
-        NodeMapKind::Dense,
         Mode::Strict,
         OnMissingSource::Fail,
-        "dense",
-    );
-    let (hash_stats, hash_arcs, hash_nm) = run_builder(
-        Path::new(CHUNK_01),
-        dir.path(),
-        NodeMapKind::Hash,
-        Mode::Strict,
-        OnMissingSource::Fail,
-        "hash",
+        "oracle",
     );
 
-    // The cheap, decisive validation that the dense optimisation is sound.
+    let oracle = java_oracle_over(Path::new(CHUNK_01));
+    let (ours, our_rows) = canonical_node_map(&node_map);
+    let (theirs, their_rows) = oracle.canonical();
+
+    assert_eq!(our_rows, their_rows, "same number of distinct nodes");
     assert_eq!(
-        dense_stats,
-        hash_stats_without_time(&hash_stats, &dense_stats)
+        ours, theirs,
+        "every (txId, offset) must get the id Java's getOrCreateId gave it"
     );
-    assert_eq!(dense_arcs, hash_arcs, "identical arc bytes");
-    assert_eq!(
-        canonical_node_map(&dense_nm),
-        canonical_node_map(&hash_nm),
-        "identical node-map sets"
-    );
+    assert_eq!(stats.distinct_nodes, oracle.next_id);
+    assert_eq!(oracle.next_id, 18620);
 }
 
-/// `elapsed_secs` is wall-clock and may differ between two runs; everything
-/// else must be identical.
-fn hash_stats_without_time(hash: &EdgeListStats, dense: &EdgeListStats) -> EdgeListStats {
-    EdgeListStats {
-        elapsed_secs: dense.elapsed_secs,
-        ..*hash
+// ------------------------------------------------- BIP-30 duplicate coinbases
+
+/// Lines 71300..71450 of `chunks/chunk_04.txt`, in-tree (18.9 KB).
+///
+/// Kept in the repository rather than read from a scratch directory for the
+/// reason `javaref_dir()` records: a fixture that can go missing turns a
+/// regression test into a silent skip, and this one guards the *default* mode
+/// of the user's production build.
+fn bip30_fixture() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("data")
+        .join("bip30")
+        .join("c04anomaly.txt")
+}
+
+/// The real BIP-30 anomaly, in the DEFAULT (strict) mode.
+///
+/// Bitcoin blocks 91812/91842 and 91722/91880 contain duplicate coinbase
+/// transactions, so `chunk_04` re-emits txId 142726 fifty-six lines after its
+/// first occurrence and txId 142572 two hundred and sixty-seven lines after
+/// its own. That is permanent consensus history, not corruption.
+///
+/// This used to be `PgError::NonDenseTxId` in *both* modes, and the remedy the
+/// error printed was a flag selecting a second, hash-backed map. The dense map
+/// now reuses the ids
+/// the first occurrence was given, exactly as Java's `getOrCreateId` did, so
+/// the flag — and the second map behind it — could be deleted.
+///
+/// `--on-missing-source create` is needed only because a 151-line slice
+/// references transactions outside itself; it has nothing to do with density.
+#[test]
+fn test_bip30_duplicate_tx_ids_succeed_in_strict_mode() {
+    let input = bip30_fixture();
+    assert!(
+        input.exists(),
+        "missing in-tree fixture {}; this is a broken checkout",
+        input.display()
+    );
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (stats, _arcs, node_map) = run_builder(
+        &input,
+        dir.path(),
+        Mode::Strict,
+        OnMissingSource::Create,
+        "bip30",
+    );
+
+    assert_eq!(stats.tx_count, 151, "one transaction per input line");
+
+    // Exactly one row per distinct (txId, offset), ascending, no duplicates.
+    let text = std::str::from_utf8(&node_map).expect("node map is ASCII");
+    let mut keys: Vec<(i64, i64)> = Vec::new();
+    let mut ids: Vec<u64> = Vec::new();
+    for l in text.lines().filter(|l| !l.is_empty()) {
+        let mut f = l.split('\t');
+        keys.push((
+            f.next().unwrap().parse().unwrap(),
+            f.next().unwrap().parse().unwrap(),
+        ));
+        ids.push(f.next().unwrap().parse().unwrap());
     }
+    let mut sorted = keys.clone();
+    sorted.sort_unstable();
+    assert_eq!(keys, sorted, "the node map is ascending by (txId, offset)");
+    let mut deduped = sorted.clone();
+    deduped.dedup();
+    assert_eq!(
+        deduped.len(),
+        keys.len(),
+        "each (txId, offset) appears exactly once"
+    );
+    let mut uniq_ids = ids.clone();
+    uniq_ids.sort_unstable();
+    uniq_ids.dedup();
+    assert_eq!(uniq_ids.len(), ids.len(), "no id is handed out twice");
+    assert_eq!(
+        keys.len() as u64,
+        stats.distinct_nodes,
+        "distinct_nodes counts exactly the rows written"
+    );
+
+    // The Java oracle. It has no notion of `--on-missing-source create`, so it
+    // knows only the output nodes; the phantoms minted for the references that
+    // point outside this 151-line slice are the difference.
+    let oracle = java_oracle_over(&input);
+
+    // Java's `Nodes:` counter is output SLOTS, so it double-counts a
+    // re-emitted coinbase; `getOrCreateId` did not, and neither do we. THAT
+    // gap is the whole BIP-30 effect. It is 1 here, not 2: only txId 142726
+    // has both of its occurrences inside this 151-line slice (see the failure
+    // message below).
+    assert_eq!(
+        stats.node_slots - oracle.nodes.len() as u64,
+        1,
+        "txId 142726 occupies two output slots but one node ({} slots, {} \
+         distinct output nodes). txId 142572, the other duplicate, is NOT \
+         collapsed here: its first occurrence is in `chunk_04` above this \
+         slice, so within the slice it is a first sighting for the dense map \
+         and for `getOrCreateId` alike.",
+        stats.node_slots,
+        oracle.nodes.len()
+    );
+
+    // Finally, the ids themselves. `--on-missing-source create` deliberately
+    // changes the id space (every phantom shifts everything after it), so the
+    // comparison against Java is made on a second run with `skip`, which mints
+    // nothing and is therefore directly comparable — same default Strict mode,
+    // same fixture, same duplicates.
+    let (skip_stats, _, skip_nm) = run_builder(
+        &input,
+        dir.path(),
+        Mode::Strict,
+        OnMissingSource::Skip,
+        "bip30skip",
+    );
+    assert_eq!(
+        skip_stats.distinct_nodes,
+        oracle.nodes.len() as u64,
+        "with `skip` only output nodes exist, exactly as in Java"
+    );
+    let skip_text = std::str::from_utf8(&skip_nm).expect("node map is ASCII");
+    let mut seen = 0usize;
+    for l in skip_text.lines().filter(|l| !l.is_empty()) {
+        let mut f = l.split('\t');
+        let tx: i32 = f.next().unwrap().parse().unwrap();
+        let off: i32 = f.next().unwrap().parse().unwrap();
+        let id: u64 = f.next().unwrap().parse().unwrap();
+        let want = oracle
+            .nodes
+            .get(&(tx, off))
+            .unwrap_or_else(|| panic!("({tx}, {off}) is not a node Java would have created"));
+        assert_eq!(
+            id, *want,
+            "({tx}, {off}) got id {id} but Java's getOrCreateId gave {want}"
+        );
+        seen += 1;
+    }
+    assert_eq!(seen, oracle.nodes.len(), "and no node of Java's is missing");
 }
 
 // ------------------------------------------------------------ sanity checks
 
 #[test]
-fn node_map_and_sink_traits_are_object_safe() {
-    // A compile-time check that the trait objects `main.rs` relies on really
-    // are object-safe, so a refactor of either trait breaks here first.
-    let mut map = new_node_map(NodeMapKind::Dense, Mode::Strict, Some(4));
-    let map_ref: &mut dyn NodeMap = &mut *map;
+fn arc_sink_trait_is_object_safe() {
+    // Was `node_map_and_sink_traits_are_object_safe`. The `NodeMap` trait is
+    // gone — there is one node map now, and `build_edge_list` takes it by
+    // concrete `&mut DenseNodeMap`, which also drops a vtable dispatch from a
+    // path that runs ~5.8e9 times at N=28. `ArcSink` is still a trait object
+    // in `main.rs`, so that half of the check stays.
+    let mut map = DenseNodeMap::with_capacity(Mode::Strict, 4);
     let mut out = Vec::<NodeId>::new();
-    map_ref.register_tx(0, 2, 1, &mut out).expect("register");
+    map.register_tx(0, 2, 1, &mut out).expect("register");
     assert_eq!(out, vec![0, 1]);
-    assert_eq!(map_ref.lookup(0, 1), Some(1));
+    assert_eq!(map.lookup(0, 1), Some(1));
 
     let mut sink = NullArcSink::new();
     let sink_ref: &mut dyn ArcSink = &mut sink;

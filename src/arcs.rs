@@ -60,6 +60,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
+use dsi_progress_logger::prelude::*;
 use log::{debug, info, warn};
 
 use crate::{
@@ -749,7 +750,10 @@ impl ArcSorter {
     /// must not be told a guess. That extra pass is pure sequential I/O over
     /// binary records and never happens in the single-run case, which is what
     /// the production configuration on this machine always hits.
-    pub fn into_sorted(mut self) -> PgResult<(SortedArcs, SortStats)> {
+    ///
+    /// `pl` is used only by that counting pass; pass `no_logging!()` when the
+    /// caller does not care.
+    pub fn into_sorted(mut self, pl: &mut impl ProgressLog) -> PgResult<(SortedArcs, SortStats)> {
         if !self.finished {
             // Not fatal: `into_sorted` does everything `finish` would have.
             // Worth saying, because a caller that skipped `finish` on one sink
@@ -803,7 +807,7 @@ impl ArcSorter {
                 "{} runs: counting distinct arcs with one merge pass to keep num_arcs exact",
                 runs.len()
             );
-            count_merged(&runs, codec, true)?
+            count_merged(&runs, codec, true, pl)?
         } else {
             self.stats.raw_arcs
         };
@@ -952,36 +956,46 @@ impl SortedArcs {
     /// Writes `graph/pg_el_N.tsv`: the sorted, deduplicated text edge list,
     /// byte-identical to what `(sort | uniq)` produced. Returns the line count.
     ///
-    /// Progress is logged every [`ARC_PROGRESS_EVERY`] arcs: at `N = 28` this
-    /// loop writes 195 GiB and used to take about ten minutes in total
-    /// silence.
-    pub fn write_tsv(&self, path: &Path) -> PgResult<u64> {
+    /// Progress goes to `pl` on the caller's `--log-interval`: at `N = 28`
+    /// this loop writes 195 GiB and used to take about ten minutes in total
+    /// silence. [`num_arcs`](Self::num_arcs) is exact, so the logger is given
+    /// an exact `expected_updates` and can show a percentage and an ETA.
+    pub fn write_tsv(&self, path: &Path, pl: &mut impl ProgressLog) -> PgResult<u64> {
         let (iter, slot) = self.iter()?;
         let mut sink = TsvArcSink::create(path)?;
-        let mut progress = ArcProgress::new("edge list", path);
+        pl.item_name("arc");
+        pl.expected_updates(Some(self.num_arcs as usize));
+        pl.start(format!(
+            "Writing the text edge list to {}...",
+            path.display()
+        ));
         for (src, dst) in iter {
             sink.push(src as NodeId, dst as NodeId)?;
-            progress.tick();
+            pl.light_update();
         }
         take_iter_error(&slot)?;
         sink.finish()?;
-        progress.done(sink.count());
+        pl.done_with_count(sink.count() as usize);
         Ok(sink.count())
     }
 
     /// Writes the sorted arcs as fixed-width little-endian binary records.
     /// Returns the arc count.
-    pub fn write_binary(&self, path: &Path) -> PgResult<u64> {
+    ///
+    /// Progress goes to `pl`, as in [`write_tsv`](Self::write_tsv).
+    pub fn write_binary(&self, path: &Path, pl: &mut impl ProgressLog) -> PgResult<u64> {
         let (iter, slot) = self.iter()?;
         let mut sink = BinaryArcSink::create(path, self.codec)?;
-        let mut progress = ArcProgress::new("binary arcs", path);
+        pl.item_name("arc");
+        pl.expected_updates(Some(self.num_arcs as usize));
+        pl.start(format!("Writing the binary arcs to {}...", path.display()));
         for (src, dst) in iter {
             sink.push(src as NodeId, dst as NodeId)?;
-            progress.tick();
+            pl.light_update();
         }
         take_iter_error(&slot)?;
         sink.finish()?;
-        progress.done(sink.count());
+        pl.done_with_count(sink.count() as usize);
         Ok(sink.count())
     }
 }
@@ -1141,78 +1155,31 @@ impl Merger {
 
 /// Counts how many arcs a merge over `paths` would yield. Used to make
 /// [`SortedArcs::num_arcs`] exact in the multi-run deduplicating case.
-fn count_merged(paths: &[PathBuf], codec: ArcCodec, dedup: bool) -> PgResult<u64> {
+///
+/// No `expected_updates`: the distinct count is precisely the unknown this
+/// pass exists to compute, so the logger reports a rate and a running total
+/// rather than a percentage.
+fn count_merged(
+    paths: &[PathBuf],
+    codec: ArcCodec,
+    dedup: bool,
+    pl: &mut impl ProgressLog,
+) -> PgResult<u64> {
     let slot = new_error_slot();
     let mut merger = Merger::open(paths, codec, dedup, slot.clone())?;
     let mut n = 0u64;
-    let mut progress = ArcProgress::new("counting merge", Path::new("spill runs"));
+    pl.item_name("arc");
+    pl.start(format!(
+        "Counting distinct arcs over {} spill runs...",
+        paths.len()
+    ));
     while merger.next_arc().is_some() {
         n += 1;
-        progress.tick();
+        pl.light_update();
     }
     take_iter_error(&slot)?;
-    progress.done(n);
+    pl.done_with_count(n as usize);
     Ok(n)
-}
-
-/// Arcs between two progress lines from the long streaming loops.
-///
-/// 100 million arcs is about 2 GiB of text edge list, i.e. a line every few
-/// seconds at full-scale throughput — enough to tell a stuck run from a slow
-/// one, rare enough to keep `logs/` small.
-pub const ARC_PROGRESS_EVERY: u64 = 100_000_000;
-
-/// Periodic `INFO` line for a loop that streams many arcs.
-pub struct ArcProgress {
-    what: &'static str,
-    path: String,
-    start: std::time::Instant,
-    seen: u64,
-    next: u64,
-}
-
-impl ArcProgress {
-    /// Starts a progress reporter for `what`, writing (or reading) `path`.
-    pub fn new(what: &'static str, path: &Path) -> Self {
-        ArcProgress {
-            what,
-            path: path.display().to_string(),
-            start: std::time::Instant::now(),
-            seen: 0,
-            next: ARC_PROGRESS_EVERY,
-        }
-    }
-
-    /// Counts one arc, logging when the threshold is reached.
-    #[inline]
-    pub fn tick(&mut self) {
-        self.seen += 1;
-        if self.seen == self.next {
-            self.next += ARC_PROGRESS_EVERY;
-            let secs = self.start.elapsed().as_secs_f64();
-            info!(
-                "{}: {} arcs in {:.0}s ({:.2e} arcs/s) -> {}",
-                self.what,
-                self.seen,
-                secs,
-                self.seen as f64 / secs.max(1e-9),
-                self.path
-            );
-        }
-    }
-
-    /// Logs the final count, unless the loop was short enough to be silent.
-    pub fn done(&self, total: u64) {
-        if total >= ARC_PROGRESS_EVERY {
-            info!(
-                "{}: {} arcs in {:.0}s -> {}",
-                self.what,
-                total,
-                self.start.elapsed().as_secs_f64(),
-                self.path
-            );
-        }
-    }
 }
 
 /// Removes `pgraph-sort-<pid>-*` spill directories left by processes that are
@@ -1528,7 +1495,20 @@ impl Iterator for BinaryArcIter {
 
 /// Sorts an existing arc file, sniffing its format. This is the backend of
 /// `pgraph sort-edges`.
-pub fn sort_file(input: &Path, opts: SortOpts) -> PgResult<(SortedArcs, SortStats)> {
+///
+/// `pl` covers the read pass and is then forwarded to
+/// [`ArcSorter::into_sorted`], whose counting merge reuses it. No
+/// `expected_updates`: the file is read as a stream and a TSV line count is
+/// not known without reading it.
+///
+/// `opts` is moved into [`ArcSorter::new`], so nothing may be read from it
+/// afterwards; that is why the logger is a parameter rather than a field of
+/// [`SortOpts`].
+pub fn sort_file(
+    input: &Path,
+    opts: SortOpts,
+    pl: &mut impl ProgressLog,
+) -> PgResult<(SortedArcs, SortStats)> {
     let format = detect_format(input, opts.codec)?;
     info!(
         "sorting {} (detected {:?}) with codec {:?}",
@@ -1537,11 +1517,14 @@ pub fn sort_file(input: &Path, opts: SortOpts) -> PgResult<(SortedArcs, SortStat
         opts.codec
     );
     let mut sorter = ArcSorter::new(opts)?;
+    pl.item_name("arc");
+    pl.start(format!("Reading the arcs of {}...", input.display()));
     match format {
         ArcFileFormat::Tsv => {
             let (iter, slot) = read_tsv_arcs(input)?;
             for (src, dst) in iter {
                 sorter.push(src as NodeId, dst as NodeId)?;
+                pl.light_update();
             }
             take_iter_error(&slot)?;
         }
@@ -1549,12 +1532,14 @@ pub fn sort_file(input: &Path, opts: SortOpts) -> PgResult<(SortedArcs, SortStat
             let (iter, slot) = read_binary_arcs(input, codec)?;
             for (src, dst) in iter {
                 sorter.push(src as NodeId, dst as NodeId)?;
+                pl.light_update();
             }
             take_iter_error(&slot)?;
         }
     }
+    pl.done();
     sorter.finish()?;
-    sorter.into_sorted()
+    sorter.into_sorted(pl)
 }
 
 // ---------------------------------------------------------------------------
@@ -1712,7 +1697,7 @@ mod tests {
             sorter.push(s, d).expect("push");
         }
         sorter.finish().expect("finish");
-        let (sorted, stats) = sorter.into_sorted().expect("into_sorted");
+        let (sorted, stats) = sorter.into_sorted(no_logging!()).expect("into_sorted");
         assert!(stats.runs >= 3, "expected several runs, got {}", stats.runs);
 
         let mut expected: Vec<(u64, u64)> = input.clone();
@@ -1751,7 +1736,7 @@ mod tests {
             sorter.push(s, d).expect("push");
         }
         sorter.finish().expect("finish");
-        let (sorted, stats) = sorter.into_sorted().expect("into_sorted");
+        let (sorted, stats) = sorter.into_sorted(no_logging!()).expect("into_sorted");
 
         let mut expected: Vec<(u64, u64)> = input.clone();
         expected.sort_unstable();
@@ -1788,7 +1773,7 @@ mod tests {
             sorter.push(s, d).expect("push");
         }
         sorter.finish().expect("finish");
-        let (sorted, stats) = sorter.into_sorted().expect("into_sorted");
+        let (sorted, stats) = sorter.into_sorted(no_logging!()).expect("into_sorted");
         assert_eq!(stats.max_node_id, big);
 
         let (iter, slot) = sorted.iter().expect("iter");
@@ -1905,7 +1890,7 @@ mod tests {
         }
         // The 1024th push fills the buffer and spills exactly one run.
         sorter.finish().expect("finish");
-        let (sorted, stats) = sorter.into_sorted().expect("into_sorted");
+        let (sorted, stats) = sorter.into_sorted(no_logging!()).expect("into_sorted");
         assert_eq!(stats.runs, 1);
 
         let run = dir.path().join("run-00000.arcs");
@@ -1946,12 +1931,12 @@ mod tests {
             tmp_dir: dir.path().to_path_buf(),
             ..SortOpts::default()
         };
-        let (sorted, stats) = sort_file(&raw, opts).expect("sort");
+        let (sorted, stats) = sort_file(&raw, opts, no_logging!()).expect("sort");
         assert_eq!(stats.raw_arcs, 4);
         assert_eq!(sorted.num_arcs(), 3);
 
         let out = dir.path().join("el.tsv");
-        assert_eq!(sorted.write_tsv(&out).expect("write_tsv"), 3);
+        assert_eq!(sorted.write_tsv(&out, no_logging!()).expect("write_tsv"), 3);
         assert_eq!(
             std::fs::read_to_string(&out).expect("read"),
             "0\t9\n1\t2\n5\t4\n"

@@ -219,24 +219,6 @@ pub enum StatsStyle {
     Extended,
 }
 
-/// Node-map implementation selector.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
-pub enum NodeMapKind {
-    /// `Vec<u64>` indexed by txId. Requires dense, monotone txIds.
-    ///
-    /// Exploits the verified invariant that `txId` is the zero-based line
-    /// number of the master transaction list. 6.23 GB at `N = 28` against the
-    /// 140-160 GB the Java `HashMap<Long, Long>` needed — which is what
-    /// `-Xmx200g` was actually paying for.
-    #[default]
-    Dense,
-    /// Literal port of the Java `HashMap<Long, Long>`.
-    ///
-    /// Always correct, never faster. Kept as the cross-check that proves the
-    /// dense path, and as the fallback for a future non-dense dataset.
-    Hash,
-}
-
 /// On-disk/in-memory arc representation.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
 pub enum ArcCodec {
@@ -493,10 +475,17 @@ pub enum PgError {
         prev_offset: i32,
     },
 
-    /// A txId broke the dense node map's "strictly +1 from 0" invariant.
+    /// A txId jumped *forward*, breaking the dense node map's "+1" invariant.
+    ///
+    /// Only a forward jump reaches this error. A txId *below* the cursor is a
+    /// repeat — the BIP-30 duplicate-coinbase case — and the node map reuses
+    /// the ids the first occurrence was given, in both modes; see
+    /// [`crate::nodemap`].
     #[error(
-        "line {line}: transaction id {found} breaks the dense node-map invariant (expected {expected}); \
-         re-run with --node-map-kind hash"
+        "line {line}: transaction id {found} skips ahead of {expected}, breaking the \
+         node-map invariant that transaction ids are consecutive; re-run with --lenient \
+         to bridge gaps of up to {gap} ids with zero-output placeholders, or repair the input",
+        gap = crate::nodemap::MAX_TX_GAP
     )]
     NonDenseTxId {
         /// 1-based line number in the concatenated input.
@@ -505,6 +494,76 @@ pub enum PgError {
         expected: i64,
         /// The txId actually found.
         found: i64,
+    },
+
+    /// A txId jumped forward by more than [`crate::nodemap::MAX_TX_GAP`], so
+    /// even [`Mode::Lenient`] refuses to bridge it.
+    ///
+    /// Distinct from [`PgError::NonDenseTxId`] for one reason: the operator is
+    /// already running with `--lenient` when they see this, so telling them to
+    /// re-run with `--lenient` would be advice they have taken. Bridging the
+    /// gap would allocate `8 * gap` bytes of zero-output filler on the strength
+    /// of a single suspicious line, which is how a two-line, 79-byte input once
+    /// drove RSS to 16 GiB.
+    #[error(
+        "line {line}: transaction id {found} skips ahead of {expected} by {gap} ids, more \
+         than the {ceiling} --lenient will bridge; filling it would allocate {bytes} bytes \
+         of zero-output placeholders for one line. Repair the input, or split it so each \
+         run starts at a transaction it actually contains",
+        gap = found - expected,
+        ceiling = crate::nodemap::MAX_TX_GAP,
+        bytes = (found - expected) as u64 * 8
+    )]
+    TxIdGapTooLarge {
+        /// 1-based line number in the concatenated input.
+        line: u64,
+        /// The txId the dense map expected next.
+        expected: i64,
+        /// The txId actually found.
+        found: i64,
+    },
+
+    /// `--on-missing-source create` was asked to mint a node for an output
+    /// whose transaction the run has **not read yet**.
+    ///
+    /// The dense node map lays a transaction's outputs out as one contiguous
+    /// id run, addressed by a prefix sum over transaction ids
+    /// ([`crate::nodemap::DenseNodeMap`]). A forced node, by contrast, lives in
+    /// the side table, and the forward-walking cursor that mints dense ids
+    /// never consults it — it has no reason to, because it only ever moves
+    /// forwards over ids it has not yet written. So if a key were forced
+    /// *ahead* of the cursor and the cursor later reached that transaction, the
+    /// same `(txId, offset)` would receive a **second** id: two node-map rows
+    /// for one output, out of ascending order, an inflated distinct-node count,
+    /// and arcs that point at whichever of the two ids happened to be visible
+    /// at the time. Refusing is the only answer that keeps the id space a
+    /// bijection.
+    ///
+    /// Nothing legitimate is lost. Java had no analogue at all — line 74 threw
+    /// `NullPointerException` on any missing source, forward or backwards — and
+    /// a Bitcoin transaction can only spend an output that already exists, so a
+    /// forward reference cannot occur in correctly ordered data (verified: zero
+    /// forward references across `chunk_04` and `chunk_05`). The reachable,
+    /// legitimate case — a chunk that starts above genesis and refers back to
+    /// transactions it does not contain — is *behind* the cursor and is minted
+    /// normally.
+    #[error(
+        "line {line}: --on-missing-source create cannot mint a node for output \
+         ({tx_id}, {offset}), because transaction {tx_id} has not been read yet (the \
+         node map has only reached transaction {reached}); minting it now would hand \
+         that output a second id once the transaction is read. Use --on-missing-source \
+         skip or fail, or feed the input in transaction order starting at genesis"
+    )]
+    ForwardForcedNode {
+        /// 1-based line number in the concatenated input.
+        line: u64,
+        /// The referenced transaction id, at or ahead of the dense cursor.
+        tx_id: i32,
+        /// The referenced output offset within that transaction.
+        offset: i32,
+        /// The highest transaction id that already has a dense slot, or
+        /// `min_tx - 1` when nothing has been registered at all.
+        reached: i64,
     },
 
     /// A transaction line was not valid UTF-8.
