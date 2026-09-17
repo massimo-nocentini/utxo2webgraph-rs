@@ -17,9 +17,15 @@ name = "pgraph"
 path = "src/main.rs"
 
 [dependencies]
-# The local, READ-ONLY webgraph-rs checkout. Cargo builds it into OUR target
-# directory; it never writes into the checkout. Never run cargo inside it.
-webgraph = { path = "/home/mnocentini/Developer/working-copies/webgraph-rs/webgraph" }
+# webgraph-rs, pinned to the exact upstream commit this port was verified
+# against (vigna/webgraph-rs main @ f8698a7, version 0.6.1). Pinning the rev
+# keeps the BVGraph output reproducible: the differential test in
+# tests/golden.rs compares it byte for byte against the Java reference.
+#
+# HTTPS rather than ssh://git@github.com/vigna/webgraph-rs.git so that a clone
+# builds without a GitHub SSH key. The two URLs are the same repository; swap
+# the line below if you would rather authenticate over SSH.
+webgraph = { git = "https://github.com/vigna/webgraph-rs.git", rev = "f8698a7bdda2c4e171017548307179cd5c7a3166" }
 
 anyhow              = { version = "1.0.79", features = ["backtrace"] }
 chrono              = { version = "0.4", default-features = false, features = ["clock", "std"] }

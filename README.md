@@ -22,10 +22,18 @@ his; nothing here claims otherwise, and every ported module repeats the
 attribution in its module documentation.
 
 BVGraph compression uses **`webgraph-rs`** by Tommaso Fontana and Sebastiano
-Vigna, consumed from a local read-only checkout at
-`/home/mnocentini/Developer/working-copies/webgraph-rs`.
-**Never edit it, never run `cargo` inside it, never `cargo update` it.** Cargo
-builds it into *our* `target/` directory; it never writes into the checkout.
+Vigna, taken straight from upstream and pinned to the exact commit this port
+was verified against:
+
+```toml
+webgraph = { git = "https://github.com/vigna/webgraph-rs.git", rev = "f8698a7bdda2c4e171017548307179cd5c7a3166" }
+```
+
+That is `vigna/webgraph-rs` `main` @ `f8698a7` (crate version 0.6.1). The rev is
+pinned deliberately: the differential suite compares this crate's BVGraph output
+byte for byte against the Java reference, so an unpinned upstream bump could
+change the compressed bytes under the tests. `ssh://git@github.com/vigna/webgraph-rs.git`
+is the same repository if you would rather authenticate over SSH.
 
 ---
 
@@ -388,14 +396,18 @@ edge corpus in `$REF/edge/` and the dense-versus-hash node-map cross-check.
 
 ## 12. Hard rules for contributors
 
-1. **Do not modify any existing file** in
-   `/data/bitcoin/2022/utxo-spllitting-pipeline` — `builder.sh`, `build_pg.sh`,
-   `splitter.sh`, the `.java` files, `jar/`, `chunks/`, `finalBCUTXO_2022`.
-   Only create or edit files under `utxo2webgraph-rs/`.
-2. **Never compile the `.java` in place.** Compile it into a scratch directory.
+1. **Leave the original pipeline alone.** Where this crate sits next to the
+   Java/shell original (`builder.sh`, `build_pg.sh`, `splitter.sh`, the `.java`
+   files, `jar/`, `chunks/`, the master transaction list), treat all of it as
+   read-only reference. It is the oracle the differential suite compares
+   against; editing it invalidates the comparison.
+2. **Never compile the reference `.java` in place.** Compile it into a scratch
+   directory, so no `.class` file lands next to the original sources.
 3. **Never run the pipeline on anything larger than `chunk_01.txt` (976 KB)**
    without a deliberate decision. `chunk_05.txt` (84 MB) is acceptable for a
-   correctness cross-check, but not for timing claims. `finalBCUTXO_2022` is
-   135 GB and is guarded in code.
-4. **Never edit, and never run `cargo` inside, the `webgraph-rs` checkout.**
-   Depend on it by path only.
+   correctness cross-check, but not for timing claims. The full
+   `finalBCUTXO_2022` is 135 GB and is guarded in code behind
+   `--i-know-this-is-big`.
+4. **Keep the `webgraph` dependency pinned to a rev.** Bumping it is fine, but
+   re-run the differential suite in section 10 in the same commit: the pin is
+   what keeps the compressed output reproducible.

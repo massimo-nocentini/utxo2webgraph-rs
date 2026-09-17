@@ -1975,6 +1975,7 @@ dependencies = [
 [[package]]
 name = "webgraph"
 version = "0.6.1"
+source = "git+https://github.com/vigna/webgraph-rs.git?rev=f8698a7bdda2c4e171017548307179cd5c7a3166#f8698a7bdda2c4e171017548307179cd5c7a3166"
 dependencies = [
  "aliasable",
  "anyhow",
