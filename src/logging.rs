@@ -1,4 +1,4 @@
-//! Logger setup for the `pgraph` binary.
+//! Logger setup for the `utxo2webgraph` binary.
 //!
 //! Binary-local on purpose. It cannot live in `cli.rs`, whose own module doc
 //! says "No I/O and no business logic live here", and it must not live in
@@ -8,18 +8,33 @@
 //!
 //! # Where the log goes
 //!
-//! Never stdout: that is the Java-compatible statistics channel, and a log
-//! line there would break a naive `diff` against the reference pipeline.
-//! Always stderr, plus a copy in `<--log-dir>/<stage>.log` — the artefact
-//! `build_pg.sh` used to leave in `logs/`, and the reason `--log-dir` exists.
+//! The two standard streams carry different things and are never mixed.
+//!
+//! **stdout is the statistics channel.** It carries exactly what a stage is
+//! contracted to report and nothing else: the `Nodes:` and `Edges:` lines of
+//! `StatsStyle::Brief`, the extra counters `StatsStyle::Extended` adds, and
+//! the periodic `--progress-every` line. That is what makes
+//! `utxo2webgraph build ... > stats.txt` and a plain `diff` against the
+//! historical `logs/pg_el_builder.log` mean something. A stray log line there
+//! would not fail the run — it would silently change the output of a stage
+//! whose output is the thing being compared, and only whoever was comparing
+//! it would ever find out.
+//!
+//! **stderr is the log channel.** Everything this module installs goes there,
+//! plus a copy in `<--log-dir>/<stage>.log`. Keeping them apart is what lets
+//! a run be watched on a terminal while its statistics are redirected to a
+//! file, and it is why the log level, the `-v` count and `RUST_LOG` can be
+//! turned up as far as `trace` without changing a single byte of stdout.
+//! The file copy is the artefact `build_pg.sh` used to leave in `logs/`, and
+//! the reason `--log-dir` exists at all.
 //!
 //! # Line format
 //!
-//! A copy of webgraph-rs `cli/src/lib.rs:998-1037`, so a `pgraph` run and a
+//! A copy of webgraph-rs `cli/src/lib.rs:998-1037`, so a `utxo2webgraph` run and a
 //! `webgraph` run in the same pipeline produce the same shape:
 //!
 //! ```text
-//! 2026-09-17 10:58:01.123 1m5s200ms INFO [ThreadId(1)] pgraph - threads=112 …
+//! 2026-09-17 10:58:01.123 1m5s200ms INFO [ThreadId(1)] utxo2webgraph - threads=112 …
 //! ```
 //!
 //! That is: the UTC wall clock (`jiff::Timestamp::strftime` formats in UTC, so
@@ -28,7 +43,7 @@
 //! logger was installed, the level, the thread id, the `log` target and the
 //! message. (`progress_logger!` sets the target to the `module_path!()` of its
 //! *construction* site; every pipeline-loop logger is built in `main.rs`, so
-//! in practice they all log under `pgraph` and `RUST_LOG` cannot single one of
+//! in practice they all log under `utxo2webgraph` and `RUST_LOG` cannot single one of
 //! them out.) It replaces `env_logger`'s own
 //! `[<UTC timestamp> <LEVEL> <target>]` prefix.
 //!
@@ -86,7 +101,7 @@ impl Write for TeeWriter {
 /// `RUST_LOG=utxo2webgraph::arcs=debug` raises that one module and leaves
 /// everything else at the `-v` level. With `default_filter_or` the default
 /// string is consulted only when `RUST_LOG` is *unset*, so the same command
-/// would silence `pgraph`, `split`, `compress` and webgraph itself, and `-v`
+/// would silence `utxo2webgraph`, `split`, `compress` and webgraph itself, and `-v`
 /// would become a no-op.
 ///
 /// Installing the logger twice is not an error here: `try_init`'s failure is

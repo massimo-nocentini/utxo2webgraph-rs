@@ -8,8 +8,8 @@
 /chunks/
 
 # Spill runs and atomic-write leftovers
-pgraph-sort-*/
-*.pgraph-tmp-*
+utxo2webgraph-sort-*/
+*.utxo2webgraph-tmp-*
 
 # Editor / OS noise
 *.swp

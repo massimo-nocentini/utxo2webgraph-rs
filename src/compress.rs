@@ -1,57 +1,74 @@
-//! BVGraph compression. Replaces `builder.GraphBuilder` in
-//! `jar/WebgraphBuilder.jar` by **Matteo Loporchio**, which ran
-//! `it.unimi.dsi.webgraph.BVGraph -g ArcListASCIIGraph <in> <out>` with argv
-//! exactly `["-g", "ArcListASCIIGraph", <elFile>, <outputPrefix>]`.
+//! BVGraph compression: the last stage of the pipeline, where the sorted arc
+//! stream becomes `<basename>.{graph,offsets,properties}`.
 //!
 //! This is the only module in the crate that touches `webgraph`,
 //! `dsi-bitstream` and `dsi-progress-logger`.
 //!
-//! # What the Java stage did, and what this does instead
+//! # Attribution
 //!
-//! `GraphBuilder.main` built the string `"-g ArcListASCIIGraph " + inputFile +
-//! " " + outputPrefix` and split it on spaces. (The constant-pool entry really
-//! does end in a space; `javap` trims trailing whitespace from its own output,
-//! which makes the literal look glued to the path.) `BVGraph.main` then loaded
-//! the text edge list through `ArcListASCIIGraph.loadMapped`, which despite its
-//! name memory-maps nothing: it reads the file sequentially into an
-//! `ArrayListMutableGraph`, one `IntArrayList` per node, entirely on the JVM
-//! heap. That materialisation is what `-Xmx200g` was paying for.
+//! The pipeline this module terminates, and the graph-construction algorithm
+//! behind it, are the work of **Matteo Loporchio**. This is an independent
+//! reimplementation of that design; the algorithm is his.
 //!
-//! Here the sorted arcs are streamed straight into `webgraph-rs`, so the graph
-//! is never materialised and the 210 GB text edge list is optional.
+//! # Streamed, never materialised
+//!
+//! The reference implementation of this stage compressed a *text* edge list,
+//! and did it by building the whole graph in memory first — one growable
+//! integer list per node, every arc resident before a single bit was written.
+//! That materialisation is what the 200 GB memory reservation in the historical
+//! run scripts was paying for, and it put a hard floor under the machine the
+//! last stage could run on.
+//!
+//! Here the sorted arcs are streamed straight into `webgraph-rs`: the graph is
+//! never materialised, peak memory is the compression window rather than the
+//! graph, and the 210 GB text edge list becomes optional — the arcs can go from
+//! the sorter to the bitstream without ever being spelled out in ASCII.
 //!
 //! # Compression parameters
 //!
 //! [`CompFlags::default()`] is
 //! `{ outdegrees: Gamma, references: Unary, blocks: Gamma, intervals: Gamma,
 //! residuals: Zeta(3), min_interval_length: 4, compression_window: 7,
-//! max_ref_count: 3 }` — **identical to the Java `BVGraph` defaults**
-//! (`windowsize=7`, `maxrefcount=3`, `minintervallength=4`, `zetak=3`). Passing
-//! it explicitly is redundant, and is done here as documentation.
+//! max_ref_count: 3 }` — **identical to the canonical `BVGraph` defaults**
+//! (`windowsize=7`, `maxrefcount=3`, `minintervallength=4`, `zetak=3`), which
+//! is what makes the bitstream interchangeable with graphs written by any other
+//! BVGraph writer, and what makes the golden byte comparison meaningful at all.
+//! Passing the flags explicitly is redundant, and is done here as
+//! documentation: a future default change upstream would otherwise silently
+//! move the output bits.
 //!
 //! `BvCompConf::bvgraphz()` and `BvCompConf::chunk_size()` are **forbidden**:
 //! they switch to the Zuckerli compressor `BvCompZ`, whose reference selection
-//! does not match Java's.
+//! is not BVGraph's. The result is a different bitstream format, not a smaller
+//! BVGraph, so nothing downstream that expects a BVGraph can read it.
 //!
 //! # Node count
 //!
-//! Java inferred `numNodes = max(id over all sources AND all targets) + 1`,
-//! filling the gaps with outdegree-0 nodes and renumbering nothing. The node
-//! map's `next_id`, by contrast, counts every UTXO slot, including the unspent
+//! The historical stage inferred `numNodes = max(id over all sources AND all
+//! targets) + 1`, filling the gaps with outdegree-0 nodes and renumbering
+//! nothing; `--num-nodes from-arcs` reproduces exactly that. The node map's
+//! `next_id`, by contrast, counts every UTXO slot, including the unspent
 //! outputs that never appear in any arc. The two genuinely differ, `next_id` is
 //! the larger, and [`CompressOpts::num_nodes`] is the caller's explicit
 //! decision between them.
 //!
+//! Neither candidate has a ceiling here: `num_nodes` is a [`crate::NodeId`]
+//! count, `usize` all the way through `webgraph-rs`, and a graph above
+//! `u32::MAX` nodes is compressed and loaded like any other; the preflight
+//! deliberately imposes no bound of its own.
+//!
 //! # `.properties` is not byte-reproducible
 //!
-//! Java's `Properties.store` writes a `#<current date>` comment line, so the
-//! file can never match byte for byte. `webgraph-rs` additionally writes a
-//! different key set, in insertion order, adding `endianness=` and `length=`
-//! and omitting all the cosmetic `bitsfor*`/`*expstats`/`*avggap` keys — all of
-//! which `BVGraph.loadInternal` ignores. Only `.graph` and `.offsets` are valid
-//! byte-comparison targets, and even there the Rust files are 4-8 bytes longer
-//! because `BufBitWriter` pads to a 64-bit word while Java pads to a byte.
-//! Compare only the first `ceil(length / 8)` bytes; the padding is all zeros.
+//! The reference `.properties` files carry a `#<generation date>` comment line,
+//! so that file can never match byte for byte — and should never be diffed.
+//! `webgraph-rs` additionally writes a different key set, in insertion order,
+//! adding `endianness=` and `length=` and omitting all the cosmetic
+//! `bitsfor*`/`*expstats`/`*avggap` keys, every one of which a BVGraph loader
+//! ignores. Only `.graph` and `.offsets` are valid byte-comparison targets, and
+//! even there the files written here are 4-8 bytes longer, because
+//! `BufBitWriter` pads the bitstream to a 64-bit word where the reference
+//! writer padded it to a byte. Compare only the first `ceil(length / 8)` bytes
+//! — the count `length=` declares; the rest is zero padding.
 
 use std::panic::AssertUnwindSafe;
 use std::path::Path;
@@ -67,7 +84,7 @@ use webgraph::graphs::arc_list_graph;
 use webgraph::prelude::*;
 
 use crate::arcs::SortedArcs;
-use crate::{new_error_slot, take_iter_error, ErrorSlot, PgError, PgResult};
+use crate::{new_error_slot, take_iter_error, ErrorSlot, Error, NodeId, Result};
 
 // ---------------------------------------------------------------------------
 // Options and statistics
@@ -98,7 +115,7 @@ pub struct CompressOpts {
     /// 2.2e9-node graph it is not free.
     pub build_ef: bool,
     /// Permit an edge list with no arcs instead of failing with
-    /// [`PgError::EmptyEdgeList`].
+    /// [`Error::EmptyEdgeList`].
     pub allow_empty: bool,
     /// How thoroughly [`verify_graph`] re-reads the graph it just wrote.
     pub verify: VerifyLevel,
@@ -165,15 +182,16 @@ pub struct CompressStats {
 /// `webgraph-rs` derives its three output paths with [`Path::with_extension`],
 /// which **replaces** an existing extension: a prefix such as `graph/pg_1.5`
 /// would produce `graph/pg_1.graph`, silently clobbering a different graph.
-/// Java built its paths by string concatenation and did not have this problem,
-/// so a prefix that was harmless before must be rejected now rather than
-/// quietly redirected.
-pub fn sanitize_basename(p: &Path) -> PgResult<()> {
+/// A pipeline that builds its three output paths by plain string concatenation
+/// never had this problem, so a prefix that was harmless in the historical run
+/// scripts has to be rejected here rather than quietly writing over the
+/// neighbouring graph.
+pub fn sanitize_basename(p: &Path) -> Result<()> {
     let Some(name) = p.file_name() else {
-        return Err(PgError::BadBasename(p.to_path_buf()));
+        return Err(Error::BadBasename(p.to_path_buf()));
     };
     if name.to_string_lossy().contains('.') {
-        return Err(PgError::BadBasename(p.to_path_buf()));
+        return Err(Error::BadBasename(p.to_path_buf()));
     }
     Ok(())
 }
@@ -203,22 +221,45 @@ fn remove_outputs(basename: &Path) {
     }
 }
 
-/// Common preflight for every entry point.
-fn prepare(basename: &Path, opts: &CompressOpts) -> PgResult<()> {
+/// Common preflight for every entry point: check the basename, then create the
+/// output directory and the compressor's temporary directory.
+///
+/// # There is deliberately no node-count ceiling
+///
+/// Nothing here bounds [`CompressOpts::num_nodes`], and nothing should. The
+/// whole compression path carries a node id as [`crate::NodeId`] — `usize`,
+/// the type `webgraph-rs` itself uses: `SequentialGraph: SequentialLabeling<Label
+/// = usize>`, `num_nodes: usize`, and a plain unbounded decimal in the
+/// `.properties` `nodes=` line. A graph above `i32::MAX` or `u32::MAX` nodes is
+/// therefore written and read back like any other.
+///
+/// An earlier version of this function rejected `num_nodes > i32::MAX` here,
+/// refusing a real 2 181 021 971-node graph — the count an `N = 28` run
+/// reaches — after the whole sort had already been paid for. Do not
+/// reintroduce it: a ceiling that fires at the last stage, on work that is
+/// already done, is the most expensive place to discover a limit.
+///
+/// # The one reader that cannot load such a graph
+///
+/// This is a real limitation and the deleted check was a clumsy way of
+/// signalling it. [`output_paths`]'s `.properties` names a `graphclass` whose
+/// reference implementation is 32-bit: it stores a node id in a signed 32-bit
+/// integer and rejects `nodes > i32::MAX` at load. A graph above that count is
+/// read back by `webgraph-rs` — including this crate's own
+/// [`verify_graph`] — but **not** by that implementation.
+///
+/// The ceiling is therefore an *interoperability* property of the consumer,
+/// not a property of the format or of this writer, and it is documented rather
+/// than enforced. Refusing to write the graph did not make that reader able to
+/// load a smaller one; it only meant the graph did not exist at all.
+fn prepare(basename: &Path, opts: &CompressOpts) -> Result<()> {
     sanitize_basename(basename)?;
-    if opts.num_nodes > i32::MAX as usize {
-        // `it.unimi.dsi.webgraph` (as opposed to `it.unimi.dsi.big.webgraph`)
-        // is 32-bit throughout: `BVGraph.loadInternal` rejects `nodes >
-        // Integer.MAX_VALUE`. At N = 28 the node-map estimate is ~2.21e9, so
-        // this *will* fire and the message has to say plainly why.
-        return Err(PgError::TooManyNodes(opts.num_nodes as u64));
-    }
     if let Some(parent) = basename.parent() {
         if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).map_err(|e| PgError::io(parent, e))?;
+            std::fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
         }
     }
-    std::fs::create_dir_all(&opts.tmp_dir).map_err(|e| PgError::io(&opts.tmp_dir, e))?;
+    std::fs::create_dir_all(&opts.tmp_dir).map_err(|e| Error::io(&opts.tmp_dir, e))?;
     Ok(())
 }
 
@@ -237,8 +278,9 @@ fn prepare(basename: &Path, opts: &CompressOpts) -> PgResult<()> {
 /// * `NodeLabels::next` returns `None` once `next_node == num_nodes`, so an arc
 ///   with `src >= num_nodes` — and every arc after it — is **silently
 ///   dropped**.
-/// * `dst` is not bounds-checked at all, so `dst >= num_nodes` produces a graph
-///   the Java reader will index out of bounds on.
+/// * `dst` is not bounds-checked at all, so `dst >= num_nodes` writes successor
+///   lists naming nodes the graph does not have — and any reader that indexes a
+///   per-node array by destination goes out of bounds on it.
 /// * `Compressor::write` computes `residuals[i] - residuals[i-1] - 1`, which
 ///   underflows on a duplicate or descending successor. Our release profile
 ///   sets `overflow-checks = true` so that panics loudly instead of wrapping
@@ -249,14 +291,14 @@ fn prepare(basename: &Path, opts: &CompressOpts) -> PgResult<()> {
 struct Validate<I> {
     inner: I,
     num_nodes: usize,
-    prev: Option<(usize, usize)>,
+    prev: Option<(NodeId, NodeId)>,
     count: Arc<AtomicU64>,
     slot: ErrorSlot,
     done: bool,
 }
 
 impl<I> Validate<I> {
-    fn fail(&mut self, e: PgError) -> Option<(usize, usize)> {
+    fn fail(&mut self, e: Error) -> Option<(NodeId, NodeId)> {
         self.done = true;
         if let Ok(mut g) = self.slot.lock() {
             if g.is_none() {
@@ -267,29 +309,29 @@ impl<I> Validate<I> {
     }
 }
 
-impl<I: Iterator<Item = (usize, usize)>> Iterator for Validate<I> {
-    type Item = (usize, usize);
+impl<I: Iterator<Item = (NodeId, NodeId)>> Iterator for Validate<I> {
+    type Item = (NodeId, NodeId);
 
     #[inline]
-    fn next(&mut self) -> Option<(usize, usize)> {
+    fn next(&mut self) -> Option<(NodeId, NodeId)> {
         if self.done {
             return None;
         }
         let (src, dst) = self.inner.next()?;
         if src >= self.num_nodes || dst >= self.num_nodes {
-            return self.fail(PgError::ArcOutOfBounds {
-                src: src as u64,
-                dst: dst as u64,
+            return self.fail(Error::ArcOutOfBounds {
+                src,
+                dst,
                 num_nodes: self.num_nodes,
             });
         }
         if let Some((p_src, p_dst)) = self.prev {
             if (src, dst) <= (p_src, p_dst) {
-                return self.fail(PgError::UnsortedArcs {
-                    p_src: p_src as u64,
-                    p_dst: p_dst as u64,
-                    c_src: src as u64,
-                    c_dst: dst as u64,
+                return self.fail(Error::UnsortedArcs {
+                    p_src,
+                    p_dst,
+                    c_src: src,
+                    c_dst: dst,
                 });
             }
         }
@@ -311,15 +353,15 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Sequential compression: the deterministic, Java-identical path
+// Sequential compression: the deterministic, reference-identical path
 // ---------------------------------------------------------------------------
 
 /// Compresses arcs that are already sorted by `(src, dst)` and deduplicated.
 ///
-/// This is the **default** path, and the one verified to reproduce the Java
-/// bitstream exactly: on the golden vector `(0,1) (0,2) (1,2) (2,0) (3,4)` over
-/// five nodes it returns 40 bits and writes `7d c5 da f1 77` / `8d 14 28 52`,
-/// matching `it.unimi.dsi.webgraph.BVGraph` byte for byte.
+/// This is the **default** path, and the one verified to reproduce the
+/// reference bitstream exactly: on the golden vector `(0,1) (0,2) (1,2) (2,0)
+/// (3,4)` over five nodes it returns 40 bits and writes `7d c5 da f1 77` /
+/// `8d 14 28 52`, which is the pinned reference output byte for byte.
 ///
 /// `num_arcs` is used only for the empty-input check and for progress
 /// forecasting; the returned [`CompressStats::arcs`] is the number actually
@@ -336,7 +378,7 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 ///   `Clone`. `NodeLabels::new` has no such bound. Note `arc_list_graph` is not
 ///   re-exported by `webgraph::prelude` and must be imported by full path.
 /// * The `comp_lender` call is wrapped in [`std::panic::catch_unwind`] so that
-///   an assertion inside `webgraph` becomes [`PgError::CompressorPanic`]
+///   an assertion inside `webgraph` becomes [`Error::CompressorPanic`]
 ///   instead of aborting the process with a bare backtrace. This is also why
 ///   the release profile deliberately does **not** set `panic = "abort"`.
 ///
@@ -349,18 +391,19 @@ pub fn compress_sorted_iter<I>(
     num_arcs: u64,
     basename: &Path,
     opts: &CompressOpts,
-) -> PgResult<CompressStats>
+) -> Result<CompressStats>
 where
-    I: Iterator<Item = (usize, usize)>,
+    I: Iterator<Item = (NodeId, NodeId)>,
 {
     prepare(basename, opts)?;
     if num_arcs == 0 && !opts.allow_empty {
-        // Fail before opening anything. Java's `ArcListASCIIGraph` ran
-        // `fillNextLine()` in its NodeIterator's instance initialiser, so a
-        // 0-byte edge list threw `IllegalArgumentException: Expected integer,
-        // found Token[EOF], line 1` two stages downstream of the real problem —
-        // which is exactly what `logs/webgraph_builder.err` records.
-        return Err(PgError::EmptyEdgeList);
+        // Fail before opening anything, and say what is actually wrong. A text
+        // edge-list reader that primes its first line while constructing its
+        // node iterator reports an empty input only as "expected an integer,
+        // found end of file, line 1" — a parse error two stages downstream of
+        // the real problem, which is exactly the cascade
+        // `logs/webgraph_builder.err` records.
+        return Err(Error::EmptyEdgeList);
     }
 
     let slot = new_error_slot();
@@ -397,7 +440,8 @@ where
     ];
     let conf = BvCompConf::new(basename)
         // Redundant — this is what `BvCompConf::new` already installs — but it
-        // is the line that documents "same parameters as the Java BVGraph".
+        // is the line that documents "the canonical BVGraph parameters", and
+        // the line that would have to change for the output bits to move.
         .comp_flags(CompFlags::default())
         .tmp_dir(&opts.tmp_dir);
     let mut conf = conf.progress_logger(&mut pl);
@@ -415,11 +459,11 @@ where
     let bits = match outcome {
         Err(payload) => {
             remove_outputs(basename);
-            return Err(PgError::CompressorPanic(panic_message(payload)));
+            return Err(Error::CompressorPanic(panic_message(payload)));
         }
         Ok(Err(e)) => {
             remove_outputs(basename);
-            return Err(PgError::other(format!(
+            return Err(Error::other(format!(
                 "could not compress the graph: {e:#}"
             )));
         }
@@ -437,11 +481,11 @@ where
 
 /// Optional Elias-Fano index, plus a last sanity check that `.properties`
 /// really landed.
-fn finish_outputs(basename: &Path, opts: &CompressOpts, arcs: u64) -> PgResult<()> {
+fn finish_outputs(basename: &Path, opts: &CompressOpts, arcs: u64) -> Result<()> {
     let props = basename.with_extension(PROPERTIES_EXTENSION);
     if !props.is_file() {
         remove_outputs(basename);
-        return Err(PgError::other(format!(
+        return Err(Error::other(format!(
             "{} was not written: the compression did not run to completion",
             props.display()
         )));
@@ -455,7 +499,7 @@ fn finish_outputs(basename: &Path, opts: &CompressOpts, arcs: u64) -> PgResult<(
             basename.with_extension(EF_EXTENSION),
             no_logging![],
         )
-        .map_err(|e| PgError::other(format!("could not build the Elias-Fano offsets: {e:#}")))?;
+        .map_err(|e| Error::other(format!("could not build the Elias-Fano offsets: {e:#}")))?;
     }
     Ok(())
 }
@@ -473,8 +517,9 @@ fn finish_outputs(basename: &Path, opts: &CompressOpts, arcs: u64) -> PgResult<(
 /// boundary cannot reference a node before it. The output is therefore
 /// semantically identical but a few bits longer (measured: 237 354 versus
 /// 237 337 bits on a 2 000-node graph); `webgraph::traits::graph::eq` passes.
-/// The Java compressor had exactly the same property — its thread count changed
-/// its output bytes too — which is why the sequential path is the default here.
+/// This is inherent to chunked parallel compression rather than a quirk of this
+/// implementation — the reference compressor's output moved with its thread
+/// count too — which is why the sequential path is the default here.
 ///
 /// # API notes
 ///
@@ -493,16 +538,16 @@ pub fn compress_unsorted_iter<I>(
     arcs: I,
     basename: &Path,
     opts: &CompressOpts,
-) -> PgResult<CompressStats>
+) -> Result<CompressStats>
 where
-    I: Iterator<Item = (usize, usize)> + Send,
+    I: Iterator<Item = (NodeId, NodeId)> + Send,
 {
     prepare(basename, opts)?;
 
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(opts.threads)
         .build()
-        .map_err(|e| PgError::other(format!("could not build the compression thread pool: {e}")))?;
+        .map_err(|e| Error::other(format!("could not build the compression thread pool: {e}")))?;
 
     info!(
         "compressing {} nodes into {} (parallel; output is NOT byte-identical to the sequential path)",
@@ -511,7 +556,7 @@ where
     );
 
     let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        pool.install(move || -> PgResult<u64> {
+        pool.install(move || -> Result<u64> {
             // `item_name` inert here too: `par_sort_pairs` sets it to "pair".
             let mut pls = progress_logger![
                 display_memory = true,
@@ -523,7 +568,7 @@ where
                 .memory_usage(MemoryUsage::MemorySize(opts.memory_bytes as usize))
                 .progress_logger(&mut pls)
                 .sort_pairs(opts.num_nodes, arcs)
-                .map_err(|e| PgError::other(format!("could not sort the arcs: {e:#}")))?;
+                .map_err(|e| Error::other(format!("could not sort the arcs: {e:#}")))?;
 
             let mut plc = progress_logger![
                 display_memory = true,
@@ -535,14 +580,14 @@ where
                 .tmp_dir(&opts.tmp_dir);
             let mut conf = conf.progress_logger(&mut plc);
             conf.par_comp::<BE, _>(sorted)
-                .map_err(|e| PgError::other(format!("could not compress the graph: {e:#}")))
+                .map_err(|e| Error::other(format!("could not compress the graph: {e:#}")))
         })
     }));
 
     let bits = match outcome {
         Err(payload) => {
             remove_outputs(basename);
-            return Err(PgError::CompressorPanic(panic_message(payload)));
+            return Err(Error::CompressorPanic(panic_message(payload)));
         }
         Ok(Err(e)) => {
             remove_outputs(basename);
@@ -558,7 +603,7 @@ where
         .unwrap_or(0);
     if arcs_written == 0 && !opts.allow_empty {
         remove_outputs(basename);
-        return Err(PgError::EmptyEdgeList);
+        return Err(Error::EmptyEdgeList);
     }
     finish_outputs(basename, opts, arcs_written)?;
     Ok(CompressStats {
@@ -580,17 +625,17 @@ pub fn compress_sorted(
     arcs: &SortedArcs,
     basename: &Path,
     opts: &CompressOpts,
-) -> PgResult<CompressStats> {
+) -> Result<CompressStats> {
     sanitize_basename(basename)?;
     if arcs.num_arcs() == 0 && !opts.allow_empty {
-        return Err(PgError::EmptyEdgeList);
+        return Err(Error::EmptyEdgeList);
     }
-    if arcs.max_node_id() >= opts.num_nodes as u64 {
+    if arcs.max_node_id() >= opts.num_nodes {
         // Caught here rather than mid-stream, so the operator learns it before
         // a multi-hour compression starts rather than after it. The exact
         // offending arc is reported by the streaming validator on the
         // sequential path; all we know up front is the maximum endpoint.
-        return Err(PgError::other(format!(
+        return Err(Error::other(format!(
             "the arc set references node {} but the graph was asked for only {} nodes; \
              pass --num-nodes from-arcs (which would give {}) or a larger explicit value",
             arcs.max_node_id(),
@@ -620,12 +665,13 @@ pub fn compress_sorted(
 
 /// Reads one `key=value` line out of `<basename>.properties`.
 ///
-/// A trivial line scan: the file is ISO-8859-1 `java.util.Properties` text and
-/// every key we care about is ASCII, so this needs no `java-properties`
-/// dependency.
-fn read_property(basename: &Path, key: &str) -> PgResult<Option<String>> {
+/// A trivial line scan: the file is a flat ISO-8859-1 `key=value` listing with
+/// `#` and `!` comment lines, and every key read here is pure ASCII, so this
+/// needs no properties-file crate — and no escape handling, since none of the
+/// values this crate reads can contain one.
+fn read_property(basename: &Path, key: &str) -> Result<Option<String>> {
     let path = basename.with_extension(PROPERTIES_EXTENSION);
-    let bytes = std::fs::read(&path).map_err(|e| PgError::io(&path, e))?;
+    let bytes = std::fs::read(&path).map_err(|e| Error::io(&path, e))?;
     let text = String::from_utf8_lossy(&bytes);
     for line in text.lines() {
         let line = line.trim();
@@ -647,15 +693,15 @@ fn read_property(basename: &Path, key: &str) -> PgResult<Option<String>> {
 /// The golden test uses it to know how many bytes of the bitstream to compare;
 /// everything past `ceil(length / 8)` is `BufBitWriter`'s zero padding to a
 /// 64-bit word.
-pub fn graph_length_bits(basename: &Path) -> PgResult<u64> {
+pub fn graph_length_bits(basename: &Path) -> Result<u64> {
     match read_property(basename, "length")? {
         Some(v) => v.parse::<u64>().map_err(|_| {
-            PgError::other(format!(
+            Error::other(format!(
                 "{}: 'length' is not an integer ({v:?})",
                 basename.with_extension(PROPERTIES_EXTENSION).display()
             ))
         }),
-        None => Err(PgError::other(format!(
+        None => Err(Error::other(format!(
             "{}: no 'length' property",
             basename.with_extension(PROPERTIES_EXTENSION).display()
         ))),
@@ -672,7 +718,7 @@ pub fn verify_graph(
     expected_nodes: usize,
     expected_arcs: u64,
     level: VerifyLevel,
-) -> PgResult<()> {
+) -> Result<()> {
     if level == VerifyLevel::None {
         debug!(
             "verification of {} skipped (--verify none)",
@@ -682,7 +728,7 @@ pub fn verify_graph(
     }
     let props = basename.with_extension(PROPERTIES_EXTENSION);
     if !props.is_file() {
-        return Err(PgError::other(format!(
+        return Err(Error::other(format!(
             "{} is missing; it is written last, so the compression did not finish",
             props.display()
         )));
@@ -690,10 +736,10 @@ pub fn verify_graph(
     let graph = BvGraphSeq::with_basename(basename)
         .endianness::<BE>()
         .load()
-        .map_err(|e| PgError::other(format!("could not load {}: {e:#}", basename.display())))?;
+        .map_err(|e| Error::other(format!("could not load {}: {e:#}", basename.display())))?;
 
     if graph.num_nodes() != expected_nodes {
-        return Err(PgError::other(format!(
+        return Err(Error::other(format!(
             "{}: the graph has {} nodes, expected {}",
             basename.display(),
             graph.num_nodes(),
@@ -702,7 +748,7 @@ pub fn verify_graph(
     }
     if let Some(declared) = graph.get_num_arcs() {
         if declared != expected_arcs {
-            return Err(PgError::other(format!(
+            return Err(Error::other(format!(
                 "{}: the graph declares {} arcs, expected {}",
                 basename.display(),
                 declared,
@@ -715,7 +761,7 @@ pub fn verify_graph(
         // is not trusted; see [`VerifyLevel`].
         let counted = graph.iter().into_pairs().count() as u64;
         if counted != expected_arcs {
-            return Err(PgError::other(format!(
+            return Err(Error::other(format!(
                 "{}: the graph contains {} arcs, expected {}",
                 basename.display(),
                 counted,
@@ -742,7 +788,7 @@ mod tests {
 
     fn tmpdir() -> tempfile::TempDir {
         tempfile::Builder::new()
-            .prefix("pgraph-compress-test-")
+            .prefix("utxo2webgraph-compress-test-")
             .tempdir()
             .expect("temp dir")
     }
@@ -764,18 +810,19 @@ mod tests {
         (n, g.iter().into_pairs().collect())
     }
 
-    /// The golden vector, reproduced byte for byte from
-    /// `it.unimi.dsi.webgraph.BVGraph` 3.6.10 (the version inside
-    /// `jar/WebgraphBuilder.jar`).
+    /// The golden vector, pinned byte for byte against the reference BVGraph
+    /// 3.6.10 bitstream. Every byte below was produced by the implementation
+    /// this crate reproduces; if the compression parameters ever drift, this
+    /// test is what notices.
     #[test]
-    fn golden_vector_matches_java_bit_for_bit() {
+    fn golden_vector_matches_the_reference_bit_for_bit() {
         let dir = tmpdir();
         let basename = dir.path().join("golden");
         let arcs = vec![(0, 1), (0, 2), (1, 2), (2, 0), (3, 4)];
 
         let stats =
             compress_sorted_iter(arcs.into_iter(), 5, &basename, &opts(&dir, 5)).expect("compress");
-        assert_eq!(stats.bits, 40, "the Java bitstream is 40 bits long");
+        assert_eq!(stats.bits, 40, "the reference bitstream is 40 bits long");
         assert_eq!(stats.nodes, 5);
         assert_eq!(stats.arcs, 5);
         assert_eq!(graph_length_bits(&basename).expect("length"), 40);
@@ -852,6 +899,26 @@ mod tests {
         assert!(sanitize_basename(Path::new("a.b/pg_1")).is_ok());
     }
 
+    /// `prepare` is where a node-count ceiling used to live: it rejected
+    /// `num_nodes > i32::MAX` and so refused the 2 181 021 971-node graph an
+    /// `N = 28` run reaches, after the entire sort had already been paid for.
+    /// Nothing downstream is 32-bit, nothing here allocates per node, and this
+    /// test exists to keep the ceiling from coming back.
+    #[test]
+    fn there_is_no_node_count_ceiling() {
+        let dir = tmpdir();
+        let basename = dir.path().join("huge");
+        for n in [
+            2_181_021_971usize,
+            i32::MAX as usize + 1,
+            u32::MAX as usize + 1,
+            usize::MAX,
+        ] {
+            prepare(&basename, &opts(&dir, n))
+                .unwrap_or_else(|e| panic!("{n} nodes must be accepted, got {e}"));
+        }
+    }
+
     #[test]
     fn unsorted_input_is_an_error_not_a_panic() {
         let dir = tmpdir();
@@ -864,7 +931,7 @@ mod tests {
         )
         .expect_err("must reject");
         match err {
-            PgError::UnsortedArcs {
+            Error::UnsortedArcs {
                 p_src,
                 p_dst,
                 c_src,
@@ -888,7 +955,7 @@ mod tests {
         let err = compress_sorted_iter(vec![(0, 5)].into_iter(), 1, &basename, &opts(&dir, 2))
             .expect_err("must reject");
         match err {
-            PgError::ArcOutOfBounds {
+            Error::ArcOutOfBounds {
                 src,
                 dst,
                 num_nodes,
@@ -905,7 +972,7 @@ mod tests {
         let basename = dir.path().join("empty");
         let err = compress_sorted_iter(std::iter::empty(), 0, &basename, &opts(&dir, 4))
             .expect_err("must reject");
-        assert!(matches!(err, PgError::EmptyEdgeList));
+        assert!(matches!(err, Error::EmptyEdgeList));
         assert!(!basename.with_extension("graph").exists());
     }
 

@@ -1,11 +1,24 @@
-//! Differential test of the whole pipeline against the compiled Java
-//! reference, on the real `chunks/chunk_01.txt`.
+//! Golden tests for the whole pipeline: the real `chunks/chunk_01.txt`, the
+//! `chunk_01 + chunk_02` concatenation, an eight-case corpus of pathological
+//! lines, and the BIP-30 duplicate-coinbase slice.
 //!
-//! The algorithm under test is **Matteo Loporchio**'s
-//! `PaymentGraphEdgeListBuilder.java`; these tests assert that the Rust port
-//! reproduces it exactly, except at the points where the port deliberately
-//! fixes a bug (each such point is asserted explicitly, with the Java
-//! behaviour named in a comment).
+//! The files under `tests/data/reference` are **recorded outputs** — node
+//! maps, edge lists and per-case expectations captured once and committed.
+//! They do not document what the code happens to do today; they lock it. A
+//! change that moves a byte of them is a change in the pipeline's observable
+//! behaviour, and has to be a deliberate one: re-record the fixture in the
+//! same commit that explains why it moved. Where a recorded fixture and this
+//! implementation deliberately disagree — `t2`'s phantom edge into node `0`,
+//! and the cases where the recorded run stopped at a malformed line and wrote
+//! nothing where this one skips the line and keeps the work it had already
+//! done — the disagreement is asserted in *both* directions: the fixture's
+//! content is pinned, and so is the divergence from it. A silent drift in
+//! either direction fails.
+//!
+//! # Attribution
+//!
+//! The pipeline and the graph-construction algorithm are the work of
+//! **Matteo Loporchio**; these tests pin this implementation of that design.
 //!
 //! Everything here drives the library API directly, so no `assert_cmd` or
 //! compiled binary is needed. Every test starts with a guard: if the corpus or
@@ -30,31 +43,29 @@ use utxo2webgraph::arcs::{ArcSorter, NullArcSink, SortOpts, TsvArcSink};
 use utxo2webgraph::compress::{self, CompressOpts, VerifyLevel};
 use utxo2webgraph::edge_list::{build_edge_list, write_node_map, EdgeListOpts, EdgeListStats};
 use utxo2webgraph::nodemap::DenseNodeMap;
-use utxo2webgraph::{
-    ArcCodec, ArcSink, Mode, NodeId, OnMissingSource, PgError, SortAlgo, StatsStyle,
-};
+use utxo2webgraph::{ArcSink, Error, Mode, NodeId, OnMissingSource, SortAlgo, StatsStyle};
 
 const CHUNK_01: &str = "/data/bitcoin/2022/utxo-spllitting-pipeline/chunks/chunk_01.txt";
 const CHUNK_02: &str = "/data/bitcoin/2022/utxo-spllitting-pipeline/chunks/chunk_02.txt";
 
-/// Where the outputs of the compiled Java reference live.
+/// Where the recorded reference outputs live.
 ///
-/// **In the crate**, under `tests/data/javaref` (3.0 MB, 35 files: the two
+/// **In the crate**, under `tests/data/reference` (3.0 MB, 35 files: the two
 /// chunk_01/chunk_02 node maps and edge lists, their concatenation, and the
 /// eight-case `edge/` corpus). They used to live in a per-session scratchpad,
 /// and `available()` turned a missing fixture into a green skip — so once that
 /// directory was reaped `cargo test` would still have reported "8 passed"
-/// while every Java-parity assertion had silently stopped running.
+/// while every byte-for-byte assertion had silently stopped running.
 ///
-/// `PGRAPH_JAVAREF` overrides the location, for a larger out-of-tree corpus.
+/// `UTXO2WEBGRAPH_REFERENCE` overrides the location, for a larger out-of-tree corpus.
 /// A missing *in-tree* fixture is a hard failure.
-fn javaref_dir() -> PathBuf {
-    match std::env::var_os("PGRAPH_JAVAREF") {
+fn reference_dir() -> PathBuf {
+    match std::env::var_os("UTXO2WEBGRAPH_REFERENCE") {
         Some(dir) => PathBuf::from(dir),
         None => Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests")
             .join("data")
-            .join("javaref"),
+            .join("reference"),
     }
 }
 
@@ -63,14 +74,14 @@ fn javaref_dir() -> PathBuf {
 /// Returns `false` (and prints a skip notice) when a *corpus* file is missing.
 ///
 /// Only the real chunk files may be absent — they are 976 KB and 796 KB of
-/// production data that does not belong in the repository. The Java reference
+/// production data that does not belong in the repository. The reference
 /// outputs are in-tree and are asserted to exist.
 fn available(paths: &[&str]) -> bool {
-    let dir = javaref_dir();
+    let dir = reference_dir();
     assert!(
         dir.is_dir(),
-        "the Java reference fixtures are missing at {}; they are part of the crate \
-         (tests/data/javaref), so this is a broken checkout, not a machine without the data",
+        "the reference fixtures are missing at {}; they are part of the crate \
+         (tests/data/reference), so this is a broken checkout, not a machine without the data",
         dir.display()
     );
     for p in paths {
@@ -82,11 +93,11 @@ fn available(paths: &[&str]) -> bool {
     true
 }
 
-fn javaref(name: &str) -> PathBuf {
-    let p = javaref_dir().join(name);
+fn reference(name: &str) -> PathBuf {
+    let p = reference_dir().join(name);
     assert!(
         p.exists(),
-        "missing in-tree Java reference fixture {}",
+        "missing in-tree reference fixture {}",
         p.display()
     );
     p
@@ -97,7 +108,7 @@ fn javaref(name: &str) -> PathBuf {
 /// Minimal MD5, inlined so the crate needs no `md-5` dependency.
 ///
 /// Only the tests need it, and only to compare against digests that were
-/// computed with `md5sum` when the Java reference was produced.
+/// computed with `md5sum` when the reference outputs were recorded.
 fn md5_hex(bytes: &[u8]) -> String {
     #[rustfmt::skip]
     const S: [u32; 64] = [
@@ -197,9 +208,10 @@ fn default_opts(mode: Mode, on_missing: OnMissingSource) -> EdgeListOpts {
         mode,
         on_missing_source: on_missing,
         progress_every: utxo2webgraph::DEFAULT_PROGRESS_EVERY,
-        // `quiet_stats` keeps the Java stdout lines out of the test output;
-        // `print_stats` is exercised by its own unit test in `edge_list.rs`.
-        stats: StatsStyle::Java,
+        // `quiet_stats` keeps the `Nodes:`/`Edges:` stdout lines out of the
+        // test output; `print_stats` is exercised by its own unit test in
+        // `edge_list.rs`.
+        stats: StatsStyle::Brief,
         quiet_stats: true,
     }
 }
@@ -239,21 +251,24 @@ fn run_builder(
 
 /// Canonicalises a node map the way `sort -t$'\t' -k1,1n -k2,2n` does.
 ///
-/// The Java node map is written by iterating `java.util.HashMap.keySet()`,
-/// i.e. **bucket order**. It merely LOOKS sorted: over chunk_01's 18 620 rows
-/// the id column has 23 descents and the txId column 5. That order is
-/// deterministic for a fixed JVM but is not a specification, so the node map
-/// is compared as a SET and never byte-for-byte.
+/// The recorded reference node map was written by walking a hash table's key
+/// set, i.e. in **bucket order**. It merely LOOKS sorted: over chunk_01's
+/// 18 620 rows the id column has 23 descents and the txId column 5. That order
+/// is reproducible for a fixed table implementation but it is not a
+/// specification of anything, so the node map is compared as a SET and never
+/// byte-for-byte. (This crate's own node map *is* written in ascending
+/// `(txId, offset)` order, and `test_bip30_duplicate_tx_ids_succeed_in_strict_mode`
+/// asserts exactly that; what is not asserted is that the recording agrees.)
 fn canonical_node_map(bytes: &[u8]) -> (String, usize) {
     let text = std::str::from_utf8(bytes).expect("node map is ASCII");
-    let mut rows: Vec<(i64, i64, u64)> = text
+    let mut rows: Vec<(i64, i64, NodeId)> = text
         .lines()
         .filter(|l| !l.is_empty())
         .map(|l| {
             let mut f = l.split('\t');
             let tx: i64 = f.next().unwrap().parse().unwrap();
             let off: i64 = f.next().unwrap().parse().unwrap();
-            let id: u64 = f.next().unwrap().parse().unwrap();
+            let id: NodeId = f.next().unwrap().parse().unwrap();
             (tx, off, id)
         })
         .collect();
@@ -269,7 +284,7 @@ fn canonical_node_map(bytes: &[u8]) -> (String, usize) {
 /// Canonicalises an edge list the way `sort -t$'\t' -k1,1n -k2,2n | uniq` does.
 fn canonical_edge_list(bytes: &[u8]) -> (String, usize) {
     let text = std::str::from_utf8(bytes).expect("edge list is ASCII");
-    let mut arcs: Vec<(u64, u64)> = text
+    let mut arcs: Vec<(NodeId, NodeId)> = text
         .lines()
         .filter(|l| !l.is_empty())
         .map(|l| {
@@ -306,11 +321,12 @@ fn test_chunk01_edge_list_byte_identical() {
         "c1",
     );
 
-    // Java printed `Processed: 18578 transactions` and `Nodes: 18620 Edges: 1094`.
+    // The recorded run over chunk_01 reported `Processed: 18578 transactions`
+    // and `Nodes: 18620  Edges: 1094`.
     assert_eq!(stats.tx_count, 18578, "one transaction per input line");
     assert_eq!(
         stats.node_slots, 18620,
-        "Java's `Nodes:` counter (output slots)"
+        "the `Nodes:` counter (output slots)"
     );
     assert_eq!(
         stats.edge_count, 1094,
@@ -325,7 +341,7 @@ fn test_chunk01_edge_list_byte_identical() {
 
     // The edge list is compared BYTE-FOR-BYTE: its order is fully determined
     // by the input (line order, then input index, then output offset).
-    let reference = fs::read(javaref("el_01.tsv")).expect("read el_01.tsv");
+    let expected_arcs = fs::read(reference("el_01.tsv")).expect("read el_01.tsv");
     assert_eq!(
         md5_hex(&arcs),
         "a3c31369f1a54bacfeb9b3cc2c953ebe",
@@ -333,8 +349,8 @@ fn test_chunk01_edge_list_byte_identical() {
     );
     assert_eq!(arcs.len(), 11_623, "el_01.tsv is 11623 bytes");
     assert_eq!(
-        arcs, reference,
-        "raw edge list must be byte-identical to Java"
+        arcs, expected_arcs,
+        "raw edge list must be byte-identical to the recorded fixture"
     );
     assert_eq!(arcs.iter().filter(|&&b| b == b'\n').count(), 1094);
 
@@ -357,11 +373,11 @@ fn test_chunk01_edge_list_byte_identical() {
         "sorted node map md5"
     );
     let (canon_ref_nm, ref_rows) =
-        canonical_node_map(&fs::read(javaref("nm_01.tsv")).expect("read nm_01.tsv"));
+        canonical_node_map(&fs::read(reference("nm_01.tsv")).expect("read nm_01.tsv"));
     assert_eq!(ref_rows, nm_rows);
     assert_eq!(canon_nm, canon_ref_nm, "the set of node triples must match");
 
-    // What `build_pg.sh` actually fed to WebGraph.
+    // What `build_pg.sh` actually fed to the graph compressor.
     let (canon_el, el_rows) = canonical_edge_list(&arcs);
     assert_eq!(
         md5_hex(canon_el.as_bytes()),
@@ -376,13 +392,13 @@ fn test_chunk01_edge_list_byte_identical() {
 
 #[test]
 fn test_chunk01_plus_02() {
-    // In-tree fixture: `javaref` asserts it exists.
-    let c12 = javaref("c12.txt");
+    // In-tree fixture: `reference` asserts it exists.
+    let c12 = reference("c12.txt");
     let dir = tempfile::tempdir().expect("tempdir");
     let (stats, arcs, node_map) =
         run_builder(&c12, dir.path(), Mode::Strict, OnMissingSource::Fail, "c12");
 
-    // Java: `Processed: 32705 transactions` / `Nodes: 32777  Edges: 3628`.
+    // Recorded: `Processed: 32705 transactions` / `Nodes: 32777  Edges: 3628`.
     assert_eq!(stats.tx_count, 32705);
     assert_eq!(stats.node_slots, 32777);
     assert_eq!(stats.edge_count, 3628);
@@ -394,8 +410,8 @@ fn test_chunk01_plus_02() {
     assert_eq!(md5_hex(&arcs), "92439127b404b877889776a816e3602c");
     assert_eq!(
         arcs,
-        fs::read(javaref("el_12.tsv")).expect("read el_12.tsv"),
-        "raw edge list must be byte-identical to Java"
+        fs::read(reference("el_12.tsv")).expect("read el_12.tsv"),
+        "raw edge list must be byte-identical to the recorded fixture"
     );
 
     let (canon_nm, nm_rows) = canonical_node_map(&node_map);
@@ -413,19 +429,18 @@ fn test_chunk01_plus_02() {
     assert_eq!(el_rows, 3628);
 }
 
-// ----------------------------------------------------------- failure parity
+// ------------------------------------------------------ failure behaviour
 
 #[test]
 fn test_chunk02_alone_fails() {
     if !available(&[CHUNK_02]) {
         return;
     }
-    // Java died here with
-    //   Cannot invoke "java.lang.Long.longValue()" because the return value of
-    //   "java.util.Map.get(Object)" is null
-    // at PaymentGraphEdgeListBuilder.java:74, leaving BOTH output files 0
-    // bytes (the node map is written only after the read loop). 134 of the
-    // chunk's 1854 input references are dangling.
+    // The recorded run died here, on the first input reference it could not
+    // resolve: the lookup returned "absent" and the value was used anyway, so
+    // the run aborted mid-read and left BOTH output files 0 bytes (the node
+    // map is written only after the read loop completes). 134 of the chunk's
+    // 1854 input references are dangling.
     let mut node_map = DenseNodeMap::new(Mode::Strict);
     let mut sink = NullArcSink::new();
     let reader = BufReader::new(fs::File::open(CHUNK_02).expect("open chunk_02"));
@@ -436,21 +451,21 @@ fn test_chunk02_alone_fails() {
         default_opts(Mode::Strict, OnMissingSource::Fail),
         no_logging!(),
     )
-    .expect_err("chunk_02 alone must fail, exactly as the Java NPE did");
+    .expect_err("chunk_02 alone must fail: it does not start at genesis");
     match err {
-        PgError::DanglingSource {
+        Error::DanglingSource {
             line,
             tx_id,
             prev_tx_id,
             ..
         } => {
-            // The improvement over Java: the error names the line, the
-            // transaction and the missing pair.
+            // The improvement over an anonymous abort: the error names the
+            // line, the transaction and the missing pair.
             assert!(line > 0, "the error must name the input line");
             assert!(tx_id >= 0);
             assert!(prev_tx_id >= 0);
         }
-        other => panic!("expected PgError::DanglingSource, got {other:?}"),
+        other => panic!("expected Error::DanglingSource, got {other:?}"),
     }
 
     // With `skip`, the same input succeeds and tallies every dangling ref.
@@ -473,9 +488,9 @@ fn test_chunk02_alone_fails() {
 
 // ------------------------------------------------------------- edge corpus
 
-/// Runs one `javaref/edge/tN.txt` case and returns its arcs and node map.
+/// Runs one `reference/edge/tN.txt` case and returns its arcs and node map.
 fn run_edge_case(tag: &str, dir: &Path, mode: Mode) -> Option<(EdgeListStats, Vec<u8>, Vec<u8>)> {
-    let input = javaref(&format!("edge/{tag}.txt"));
+    let input = reference(&format!("edge/{tag}.txt"));
     if !input.exists() {
         eprintln!("SKIP: {} is not present", input.display());
         return None;
@@ -503,7 +518,7 @@ fn run_edge_case(tag: &str, dir: &Path, mode: Mode) -> Option<(EdgeListStats, Ve
 }
 
 fn reference_case(tag: &str, ext: &str) -> Vec<u8> {
-    fs::read(javaref(&format!("edge/{tag}.{ext}"))).unwrap_or_default()
+    fs::read(reference(&format!("edge/{tag}.{ext}"))).unwrap_or_default()
 }
 
 #[test]
@@ -513,16 +528,16 @@ fn test_edge_case_corpus() {
     }
     let dir = tempfile::tempdir().expect("tempdir");
 
-    // --- t1: a zero-output line (`info:inputs:`). Java's split(":") returned
-    // only 2 sections, so `parts[2]` threw ArrayIndexOutOfBoundsException at
-    // line 55 and BOTH reference files are 0 bytes. The port skips the line in
-    // Lenient mode, so the arcs still match (both empty) but the node map
-    // holds the first line's output, which Java never got to write.
+    // --- t1: line 2 ends in a separator (`info:inputs:`), so its output
+    // section is an empty trailing field. A trailing run of separators is not
+    // significant — `"a:b:"` has two fields — so the line offers only 2
+    // sections where a record needs 3, and the recorded run stopped there
+    // with BOTH its files at 0 bytes. This implementation skips the line in
+    // Lenient mode, so the arcs still match (both empty) while the node map
+    // keeps line 1's output, which the recorded run never got as far as
+    // writing.
     if let Some((stats, arcs, nm)) = run_edge_case("t1", dir.path(), Mode::Lenient) {
-        assert!(
-            arcs.is_empty(),
-            "t1: no edges, as in the (crashed) Java run"
-        );
+        assert!(arcs.is_empty(), "t1: no edges, as in the recorded run");
         assert_eq!(reference_case("t1", "el"), arcs);
         assert_eq!(
             stats.skipped_lines, 1,
@@ -532,14 +547,18 @@ fn test_edge_case_corpus() {
         assert_eq!(rows, 1, "t1: line 1's single output is still registered");
         assert!(
             reference_case("t1", "nm").is_empty(),
-            "t1: Java wrote nothing because it crashed before the node-map loop"
+            "t1: the recorded run wrote nothing, having stopped before its node-map loop"
         );
     }
 
-    // --- t2: a 4-colon-section line, so `parts[2] == ""`. Java sized
-    // `currentOutputNodeIds` as `"".split(";").length == 1`, left it at its
-    // default `{0}`, and emitted the phantom edge `0\t0`: it printed
-    // `Nodes: 1  Edges: 1`. THE PORT MUST EMIT ZERO EDGES.
+    // --- t2: a line with FOUR colon-separated sections, so its third section
+    // is the empty string. The recorded run took the first three sections,
+    // measured the empty output list as one entry, left that entry at its
+    // zero-initialised default, and emitted the phantom edge `0\t0`: it
+    // printed `Nodes: 1  Edges: 1`. THIS IMPLEMENTATION MUST EMIT ZERO EDGES —
+    // a record with the wrong number of sections is rejected outright, because
+    // taking the first three of a longer line silently reinterprets it. Both
+    // halves are pinned: the fixture's `0\t0` and our empty output.
     if let Some((stats, arcs, nm)) = run_edge_case("t2", dir.path(), Mode::Lenient) {
         assert_eq!(reference_case("t2", "el"), b"0\t0\n".to_vec());
         assert!(
@@ -549,11 +568,13 @@ fn test_edge_case_corpus() {
         assert_eq!(stats.edge_count, 0);
         let (canon, rows) = canonical_node_map(&nm);
         assert_eq!(rows, 1);
-        assert_eq!(canon, "0\t0\t0\n", "t2: the node map still matches Java");
+        assert_eq!(canon, "0\t0\t0\n", "t2: the node map still matches");
     }
 
-    // --- t3: `info::` -> one section. Java threw AIOOBE at line 54; both
-    // reference files are empty. The port skips and matches exactly.
+    // --- t3: `info::` — both trailing sections empty, so after dropping the
+    // insignificant trailing run exactly ONE section remains. The recorded run
+    // stopped on it and both its files are empty; this one skips and matches
+    // exactly.
     if let Some((stats, arcs, nm)) = run_edge_case("t3", dir.path(), Mode::Lenient) {
         assert_eq!(arcs, reference_case("t3", "el"));
         assert_eq!(nm, reference_case("t3", "nm"));
@@ -561,9 +582,10 @@ fn test_edge_case_corpus() {
         assert_eq!(stats.skipped_lines, 1);
     }
 
-    // --- t4: a trailing blank line. Java threw AIOOBE at line 54 and wrote
-    // nothing. The port skips blank lines in BOTH modes and keeps going, so
-    // the edge list matches while the node map holds line 1's output.
+    // --- t4: a trailing blank line. The recorded run stopped on it and wrote
+    // nothing. Blank lines are skipped here in BOTH modes and the run keeps
+    // going, so the edge list matches while the node map holds line 1's
+    // output. A file that ends in a newline is the normal case, not an error.
     if let Some((stats, arcs, nm)) = run_edge_case("t4", dir.path(), Mode::Lenient) {
         assert!(arcs.is_empty());
         assert_eq!(arcs, reference_case("t4", "el"));
@@ -575,14 +597,17 @@ fn test_edge_case_corpus() {
         assert_eq!(rows, 1);
         assert!(
             reference_case("t4", "nm").is_empty(),
-            "t4: Java crashed first"
+            "t4: the recorded run stopped first"
         );
     }
 
-    // --- t5: txId = 3000000000, above i32::MAX. Java threw
-    // `NumberFormatException: For input string: "3000000000"`. The port keeps
-    // i32 semantics and reports the line and the offending text; in Lenient
-    // mode the line is skipped, so both files match Java's (empty) output.
+    // --- t5: txId = 3000000000, above `i32::MAX`. txIds are `i32` because
+    // that is the input format's own width; widening them would change the
+    // `pack` key of everything at or above 2^31 and rewrite the whole node
+    // map. So the value is out of range, and the error reports the line and
+    // the offending text verbatim rather than a bare range complaint. In
+    // Lenient mode the line is skipped, so both files match the recorded
+    // (empty) output.
     if let Some((stats, arcs, nm)) = run_edge_case("t5", dir.path(), Mode::Lenient) {
         assert_eq!(arcs, reference_case("t5", "el"));
         assert_eq!(nm, reference_case("t5", "nm"));
@@ -590,7 +615,7 @@ fn test_edge_case_corpus() {
     }
     // In Strict mode it is a typed, line-numbered error.
     {
-        let input = javaref("edge/t5.txt");
+        let input = reference("edge/t5.txt");
         if input.exists() {
             let mut node_map = DenseNodeMap::new(Mode::Strict);
             let mut sink = NullArcSink::new();
@@ -604,17 +629,23 @@ fn test_edge_case_corpus() {
             )
             .expect_err("t5 must fail in strict mode");
             assert!(
-                matches!(err, PgError::BadInteger { .. }),
+                matches!(err, Error::BadInteger { .. }),
                 "t5: expected BadInteger, got {err:?}"
             );
         }
     }
 
-    // --- t6: txId = -5. `Integer.parseInt("-5")` succeeded in Java, the value
-    // round-tripped through pack/unpack, and the node map printed `-5 0 0`.
-    // Lenient is bug-compatible; Strict rejects it.
+    // --- t6: txId = -5. It parses as an `i32`, round-trips through
+    // `pack`/`unpack` untouched, and reaches the node map's first column as a
+    // literal `-5` rather than as `4294967291` — which is what the recorded
+    // `-5\t0\t0` row shows. Lenient reproduces that exactly; Strict rejects a
+    // negative id, because no downstream consumer of the node map expects one.
     if let Some((_, arcs, nm)) = run_edge_case("t6", dir.path(), Mode::Lenient) {
-        assert_eq!(arcs, reference_case("t6", "el"), "t6: Java emitted `0\t1`");
+        assert_eq!(
+            arcs,
+            reference_case("t6", "el"),
+            "t6: the recorded arc is `0\t1`"
+        );
         let (canon, rows) = canonical_node_map(&nm);
         let (ref_canon, ref_rows) = canonical_node_map(&reference_case("t6", "nm"));
         assert_eq!(rows, ref_rows);
@@ -624,7 +655,7 @@ fn test_edge_case_corpus() {
         );
     }
     {
-        let input = javaref("edge/t6.txt");
+        let input = reference("edge/t6.txt");
         if input.exists() {
             let mut node_map = DenseNodeMap::new(Mode::Strict);
             let mut sink = NullArcSink::new();
@@ -638,15 +669,16 @@ fn test_edge_case_corpus() {
             )
             .expect_err("t6 must fail in strict mode");
             assert!(
-                matches!(err, PgError::NegativeId { .. }),
+                matches!(err, Error::NegativeId { .. }),
                 "t6: expected NegativeId, got {err:?}"
             );
         }
     }
 
-    // --- t7: a transaction spending its own output. Outputs are registered
-    // BEFORE the input loop (Java lines 59-67 precede 68-80), so the lookup
-    // succeeds and a SELF-LOOP is emitted. MUST match Java exactly.
+    // --- t7: a transaction spending its own output. A transaction's outputs
+    // are registered BEFORE its inputs are resolved, so the lookup succeeds
+    // and a SELF-LOOP is emitted. That ordering is part of the algorithm, not
+    // an accident, so this MUST match the recording exactly.
     if let Some((stats, arcs, nm)) = run_edge_case("t7", dir.path(), Mode::Lenient) {
         assert_eq!(arcs, reference_case("t7", "el"), "t7: self-loop `0\t0`");
         assert_eq!(arcs, b"0\t0\n".to_vec());
@@ -658,7 +690,8 @@ fn test_edge_case_corpus() {
 
     // --- t8: two inputs of the same transaction resolving to the same source
     // node, so the m x n join emits `0\t2` twice. Duplicates are NOT filtered
-    // by the builder (`build_pg.sh` deduped afterwards). MUST match Java.
+    // by the builder (`build_pg.sh` deduped afterwards, and `ArcSorter` does
+    // it now). MUST match the recording.
     if let Some((stats, arcs, nm)) = run_edge_case("t8", dir.path(), Mode::Lenient) {
         assert_eq!(arcs, reference_case("t8", "el"), "t8: `0\t2` emitted twice");
         assert_eq!(arcs, b"0\t2\n0\t2\n".to_vec());
@@ -675,7 +708,6 @@ fn test_edge_case_corpus() {
 fn sort_opts(tmp: &Path) -> SortOpts {
     SortOpts {
         algo: SortAlgo::Radix,
-        codec: ArcCodec::Packed32,
         dedup: true,
         memory_bytes: 64 * 1024 * 1024,
         tmp_dir: tmp.to_path_buf(),
@@ -690,18 +722,19 @@ fn compress_opts(num_nodes: usize, tmp: &Path) -> CompressOpts {
         tmp_dir: tmp.to_path_buf(),
         threads: 1,
         memory_bytes: 64 * 1024 * 1024,
-        // Sequential is the byte-identical-to-Java path.
+        // Sequential: one deterministic path, which is what a golden
+        // assertion on the compressed bytes needs.
         parallel: false,
         build_ef: false,
         allow_empty: false,
-        // The differential test recounts every arc on purpose.
+        // The golden test recounts every arc on purpose.
         verify: VerifyLevel::Full,
         log_interval: std::time::Duration::from_secs(10),
     }
 }
 
 /// Reads a BVGraph back and returns its arcs in `(src, dst)` order.
-fn read_back(basename: &Path) -> (usize, Vec<(usize, usize)>) {
+fn read_back(basename: &Path) -> (usize, Vec<(NodeId, NodeId)>) {
     let graph = BvGraphSeq::with_basename(basename)
         .endianness::<BE>()
         .load()
@@ -762,8 +795,8 @@ fn test_full_pipeline_chunk01() {
         "sorted, deduplicated edge list md5"
     );
 
-    // --- from-arcs: what Java's ArcListASCIIGraph inferred, max(id) + 1.
-    let from_arcs = sorted.max_node_id() as usize + 1;
+    // --- from-arcs: the node count inferred from the arc stream, max(id) + 1.
+    let from_arcs = sorted.max_node_id() + 1;
     assert_eq!(from_arcs, 18545);
     let base_a = dir.path().join("pg_a");
     let cstats = compress::compress_sorted(&sorted, &base_a, &compress_opts(from_arcs, &tmp))
@@ -779,14 +812,14 @@ fn test_full_pipeline_chunk01() {
     }
 
     // Reading the graph back must reproduce the exact sorted arc list.
-    let expected: Vec<(usize, usize)> = std::str::from_utf8(&el_bytes)
+    let expected: Vec<(NodeId, NodeId)> = std::str::from_utf8(&el_bytes)
         .unwrap()
         .lines()
         .map(|l| {
             let mut f = l.split('\t');
             (
-                f.next().unwrap().parse::<usize>().unwrap(),
-                f.next().unwrap().parse::<usize>().unwrap(),
+                f.next().unwrap().parse::<NodeId>().unwrap(),
+                f.next().unwrap().parse::<NodeId>().unwrap(),
             )
         })
         .collect();
@@ -798,9 +831,8 @@ fn test_full_pipeline_chunk01() {
     // difference is the semantic divergence the README calls out: the 75
     // highest-numbered outputs of chunk_01 are unspent and appear in no arc.
     let base_b = dir.path().join("pg_b");
-    let bstats =
-        compress::compress_sorted(&sorted, &base_b, &compress_opts(next_id as usize, &tmp))
-            .expect("compress_sorted with the node-map count");
+    let bstats = compress::compress_sorted(&sorted, &base_b, &compress_opts(next_id, &tmp))
+        .expect("compress_sorted with the node-map count");
     assert_eq!(bstats.nodes, 18620);
     compress::verify_graph(&base_b, 18620, 1094, VerifyLevel::Full).expect("verify_graph");
     let (nodes_b, arcs_b) = read_back(&base_b);
@@ -816,27 +848,28 @@ fn test_full_pipeline_chunk01() {
     );
 }
 
-// ------------------------------------ node map vs the Java getOrCreateId oracle
+// ------------------------------- node map vs the assign-on-first-sight oracle
 
-/// Java's node map, transcribed from `PaymentGraphEdgeListBuilder.java:18-22`:
+/// The reference id-assignment rule, transcribed as an independent oracle.
 ///
-/// ```java
-/// public static long getOrCreateId(long key) {
-///     long id = nodes.getOrDefault(key, -1L);
-///     if (id == -1L) { id = nextId++; nodes.put(key, id); }
-///     return id;
-/// }
-/// ```
+/// A key is looked up in a table; if it is absent it takes the next free id
+/// and the counter advances, and if it is present it keeps the id it already
+/// has and the counter does NOT move. Every output slot of every transaction
+/// is offered to that rule, in offset order, as the input is read.
 ///
-/// A repeated key keeps its original id and `nextId` does not move.
+/// That is the entire specification of the node id space, and it is written
+/// out here — plain hash map, no dense cursor, no prefix sum — precisely so it
+/// shares no code with `DenseNodeMap`. When the two agree on 18 620 real
+/// nodes, the dense map's arithmetic is confirmed against the rule it claims
+/// to implement, not against itself.
 #[derive(Default)]
-struct JavaOracle {
-    nodes: std::collections::HashMap<(i32, i32), u64>,
-    next_id: u64,
+struct IdOracle {
+    nodes: std::collections::HashMap<(i32, i32), NodeId>,
+    next_id: NodeId,
 }
 
-impl JavaOracle {
-    /// Java lines 59-65: one `getOrCreateId` per output slot, offsets ascending.
+impl IdOracle {
+    /// One id per output slot, offsets ascending.
     fn register(&mut self, tx: i32, num_outputs: u32) {
         for offset in 0..num_outputs as i32 {
             let next = &mut self.next_id;
@@ -850,7 +883,7 @@ impl JavaOracle {
 
     /// The same `txId\toffset\tid` rows the node map writes, sorted.
     fn canonical(&self) -> (String, usize) {
-        let mut rows: Vec<(i32, i32, u64)> =
+        let mut rows: Vec<(i32, i32, NodeId)> =
             self.nodes.iter().map(|(&(t, o), &i)| (t, o, i)).collect();
         rows.sort_unstable();
         let mut out = String::new();
@@ -861,11 +894,11 @@ impl JavaOracle {
     }
 }
 
-/// Runs the Java oracle over every record of `input`, exactly as the reference
-/// implementation's read loop did.
-fn java_oracle_over(input: &Path) -> JavaOracle {
+/// Runs the oracle over every record of `input`, in the same order the
+/// builder's read loop visits them.
+fn oracle_over(input: &Path) -> IdOracle {
     use std::io::BufRead;
-    let mut oracle = JavaOracle::default();
+    let mut oracle = IdOracle::default();
     let reader = BufReader::new(fs::File::open(input).expect("open input"));
     let opts = utxo2webgraph::record::ParseOpts { mode: Mode::Strict };
     for (i, line) in reader.lines().enumerate() {
@@ -881,11 +914,12 @@ fn java_oracle_over(input: &Path) -> JavaOracle {
 
 /// Was `test_dense_vs_hash_agree`, which drove the deleted hash-backed node
 /// map over the same input and diffed the two. That map is gone, so the
-/// counterpart is now the inline Java oracle above: the cross-check is still
-/// against the reference semantics, on real data, and it is now against the
-/// *actual* Java source rather than against a second Rust transcription of it.
+/// counterpart is now the inline oracle above: the cross-check is still
+/// against the reference semantics, on real data, and it is now against a
+/// direct, twenty-line statement of the id-assignment rule rather than
+/// against a second production node map with its own machinery to get wrong.
 #[test]
-fn test_node_map_matches_the_java_oracle_on_chunk01() {
+fn test_node_map_matches_the_id_oracle_on_chunk01() {
     if !available(&[CHUNK_01]) {
         return;
     }
@@ -898,16 +932,16 @@ fn test_node_map_matches_the_java_oracle_on_chunk01() {
         "oracle",
     );
 
-    let oracle = java_oracle_over(Path::new(CHUNK_01));
+    let oracle = oracle_over(Path::new(CHUNK_01));
     let (ours, our_rows) = canonical_node_map(&node_map);
     let (theirs, their_rows) = oracle.canonical();
 
     assert_eq!(our_rows, their_rows, "same number of distinct nodes");
     assert_eq!(
         ours, theirs,
-        "every (txId, offset) must get the id Java's getOrCreateId gave it"
+        "every (txId, offset) must get the id the assign-on-first-sight rule gives it"
     );
-    assert_eq!(stats.distinct_nodes, oracle.next_id);
+    assert_eq!(stats.distinct_nodes, oracle.next_id as u64);
     assert_eq!(oracle.next_id, 18620);
 }
 
@@ -916,7 +950,7 @@ fn test_node_map_matches_the_java_oracle_on_chunk01() {
 /// Lines 71300..71450 of `chunks/chunk_04.txt`, in-tree (18.9 KB).
 ///
 /// Kept in the repository rather than read from a scratch directory for the
-/// reason `javaref_dir()` records: a fixture that can go missing turns a
+/// reason `reference_dir()` records: a fixture that can go missing turns a
 /// regression test into a silent skip, and this one guards the *default* mode
 /// of the user's production build.
 fn bip30_fixture() -> PathBuf {
@@ -934,11 +968,11 @@ fn bip30_fixture() -> PathBuf {
 /// first occurrence and txId 142572 two hundred and sixty-seven lines after
 /// its own. That is permanent consensus history, not corruption.
 ///
-/// This used to be `PgError::NonDenseTxId` in *both* modes, and the remedy the
+/// This used to be `Error::NonDenseTxId` in *both* modes, and the remedy the
 /// error printed was a flag selecting a second, hash-backed map. The dense map
-/// now reuses the ids
-/// the first occurrence was given, exactly as Java's `getOrCreateId` did, so
-/// the flag — and the second map behind it — could be deleted.
+/// now reuses the ids the first occurrence was given — exactly what the
+/// assign-on-first-sight rule prescribes — so the flag, and the second map
+/// behind it, could be deleted.
 ///
 /// `--on-missing-source create` is needed only because a 151-line slice
 /// references transactions outside itself; it has nothing to do with density.
@@ -964,7 +998,7 @@ fn test_bip30_duplicate_tx_ids_succeed_in_strict_mode() {
     // Exactly one row per distinct (txId, offset), ascending, no duplicates.
     let text = std::str::from_utf8(&node_map).expect("node map is ASCII");
     let mut keys: Vec<(i64, i64)> = Vec::new();
-    let mut ids: Vec<u64> = Vec::new();
+    let mut ids: Vec<NodeId> = Vec::new();
     for l in text.lines().filter(|l| !l.is_empty()) {
         let mut f = l.split('\t');
         keys.push((
@@ -993,16 +1027,16 @@ fn test_bip30_duplicate_tx_ids_succeed_in_strict_mode() {
         "distinct_nodes counts exactly the rows written"
     );
 
-    // The Java oracle. It has no notion of `--on-missing-source create`, so it
+    // The oracle. It has no notion of `--on-missing-source create`, so it
     // knows only the output nodes; the phantoms minted for the references that
     // point outside this 151-line slice are the difference.
-    let oracle = java_oracle_over(&input);
+    let oracle = oracle_over(&input);
 
-    // Java's `Nodes:` counter is output SLOTS, so it double-counts a
-    // re-emitted coinbase; `getOrCreateId` did not, and neither do we. THAT
-    // gap is the whole BIP-30 effect. It is 1 here, not 2: only txId 142726
-    // has both of its occurrences inside this 151-line slice (see the failure
-    // message below).
+    // The `Nodes:` counter is output SLOTS, so it double-counts a re-emitted
+    // coinbase; the assign-on-first-sight rule does not, and neither do we.
+    // THAT gap is the whole BIP-30 effect. It is 1 here, not 2: only txId
+    // 142726 has both of its occurrences inside this 151-line slice (see the
+    // failure message below).
     assert_eq!(
         stats.node_slots - oracle.nodes.len() as u64,
         1,
@@ -1010,16 +1044,16 @@ fn test_bip30_duplicate_tx_ids_succeed_in_strict_mode() {
          distinct output nodes). txId 142572, the other duplicate, is NOT \
          collapsed here: its first occurrence is in `chunk_04` above this \
          slice, so within the slice it is a first sighting for the dense map \
-         and for `getOrCreateId` alike.",
+         and for the oracle alike.",
         stats.node_slots,
         oracle.nodes.len()
     );
 
     // Finally, the ids themselves. `--on-missing-source create` deliberately
     // changes the id space (every phantom shifts everything after it), so the
-    // comparison against Java is made on a second run with `skip`, which mints
-    // nothing and is therefore directly comparable — same default Strict mode,
-    // same fixture, same duplicates.
+    // comparison against the oracle is made on a second run with `skip`, which
+    // mints nothing and is therefore directly comparable — same default Strict
+    // mode, same fixture, same duplicates.
     let (skip_stats, _, skip_nm) = run_builder(
         &input,
         dir.path(),
@@ -1030,7 +1064,7 @@ fn test_bip30_duplicate_tx_ids_succeed_in_strict_mode() {
     assert_eq!(
         skip_stats.distinct_nodes,
         oracle.nodes.len() as u64,
-        "with `skip` only output nodes exist, exactly as in Java"
+        "with `skip` only output nodes exist, exactly as in the oracle"
     );
     let skip_text = std::str::from_utf8(&skip_nm).expect("node map is ASCII");
     let mut seen = 0usize;
@@ -1038,18 +1072,22 @@ fn test_bip30_duplicate_tx_ids_succeed_in_strict_mode() {
         let mut f = l.split('\t');
         let tx: i32 = f.next().unwrap().parse().unwrap();
         let off: i32 = f.next().unwrap().parse().unwrap();
-        let id: u64 = f.next().unwrap().parse().unwrap();
+        let id: NodeId = f.next().unwrap().parse().unwrap();
         let want = oracle
             .nodes
             .get(&(tx, off))
-            .unwrap_or_else(|| panic!("({tx}, {off}) is not a node Java would have created"));
+            .unwrap_or_else(|| panic!("({tx}, {off}) is not a node the oracle would have created"));
         assert_eq!(
             id, *want,
-            "({tx}, {off}) got id {id} but Java's getOrCreateId gave {want}"
+            "({tx}, {off}) got id {id} but the oracle gave {want}"
         );
         seen += 1;
     }
-    assert_eq!(seen, oracle.nodes.len(), "and no node of Java's is missing");
+    assert_eq!(
+        seen,
+        oracle.nodes.len(),
+        "and no node of the oracle's is missing"
+    );
 }
 
 // ------------------------------------------------------------ sanity checks

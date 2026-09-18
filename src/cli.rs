@@ -1,6 +1,11 @@
-//! `pgraph` command line. Replaces `splitter.sh`, `builder.sh`, `build_pg.sh`,
-//! `java PaymentGraphEdgeListBuilder` and `java -jar jar/WebgraphBuilder.jar` —
-//! the pipeline by **Matteo Loporchio**.
+//! `utxo2webgraph` command line: one subcommand per pipeline stage, plus the
+//! two fused stages (`build-pg`, `build`) that run the whole thing end to end.
+//!
+//! # Attribution
+//!
+//! The pipeline these subcommands drive, and the graph-construction algorithm
+//! at its centre, are the work of **Matteo Loporchio**; this crate is an
+//! independent reimplementation of that design.
 //!
 //! This module is pure declaration: the `clap` derive types, a handful of
 //! `ValueEnum` mirrors of the shared-contract enums, and two tiny parsers.
@@ -17,32 +22,40 @@ use std::time::Duration;
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 
 use crate::compress::VerifyLevel;
-use crate::{ArcCodec, Mode, OnMissingSource, SortAlgo, StatsStyle};
+use crate::{Mode, OnMissingSource, SortAlgo, StatsStyle};
 
-/// The shell-to-Rust equivalence table, shown by `pgraph --help`.
+/// The subcommand overview, shown by `utxo2webgraph --help`.
 const LONG_ABOUT: &str = "\
 Build the Bitcoin Payment Graph from a transaction list.
 
-A Rust port of the pipeline by Matteo Loporchio. Every stage of the original
-shell/Java pipeline has a direct equivalent:
+The pipeline is four stages, one subcommand each. Every stage reads what the
+previous one wrote, so any of them can be run on its own:
 
-  ./splitter.sh finalBCUTXO_2022                       -> pgraph split finalBCUTXO_2022
-  ./builder.sh 15                                      -> pgraph build 15
-  ./build_pg.sh IN NM EL PFX                           -> pgraph build-pg -i IN --node-map NM --edge-list EL --output-prefix PFX
-  java PaymentGraphEdgeListBuilder IN NM EL            -> pgraph edge-list -i IN --node-map NM --arcs EL --arc-format tsv
-  sort -t$'\\t' -k1,1n -k2,2n EL | uniq > OUT           -> pgraph sort-edges EL --edge-list OUT
-  java -jar jar/WebgraphBuilder.jar EL PFX             -> pgraph compress EL PFX --num-nodes from-arcs
+  split        cut a whole-chain transaction list into six-month chunk_NN.txt
+  edge-list    read chunks; write the node map and the raw, unsorted arc stream
+  sort-edges   sort those arcs by (src, dst) ascending and drop duplicates
+  compress     turn a sorted arc list into PREFIX.{graph,offsets,properties}
 
-`--num-nodes` defaults to `from-arcs` everywhere, which is what
-ArcListASCIIGraph computed (max endpoint + 1) and therefore what the shell
-pipeline produced; `--num-nodes node-map` is the opt-in richer graph in which
-every UTXO, spent or not, is a node.
+Two subcommands fuse the last three, so the arcs never have to be written out
+as decimal text at all:
 
-stdout carries the Java-compatible statistics; all logging goes to stderr.";
+  build-pg     edge-list + sort-edges + compress over one input
+  build N      the same over chunks 1..N, streamed, producing
+               graph/pg_nm_N.tsv, graph/pg_el_N.tsv and graph/pg_N.*
 
-/// The `pgraph` command line.
+`--num-nodes` defaults to `from-arcs` everywhere: max(endpoint) + 1. That is
+the smallest node count the arcs require, not a count of the outputs an arc
+touches - every id below the maximum is a node whether or not an arc reaches
+it, so isolated nodes in the middle are kept and only unspent outputs numbered
+*above* the maximum are dropped. `--num-nodes node-map` is the opt-in richer
+graph in which every UTXO, spent or not, is a node; pass it with `--node-map`
+and both counts are logged so the difference is visible.
+
+stdout carries the statistics; all logging goes to stderr.";
+
+/// The `utxo2webgraph` command line.
 #[derive(Parser, Debug)]
-#[command(name = "pgraph", version, propagate_version = true,
+#[command(name = "utxo2webgraph", version, propagate_version = true,
           about = "Build the Bitcoin Payment Graph from a transaction list",
           long_about = LONG_ABOUT)]
 pub struct Cli {
@@ -57,7 +70,7 @@ pub struct Cli {
 /// Options that apply to every stage.
 ///
 /// All of them are `global`, so they may be given before *or* after the
-/// subcommand: `pgraph --threads 64 build 15` and `pgraph build 15
+/// subcommand: `utxo2webgraph --threads 64 build 15` and `utxo2webgraph build 15
 /// --threads 64` are the same command.
 #[derive(Args, Debug, Clone)]
 pub struct CommonOpts {
@@ -70,8 +83,9 @@ pub struct CommonOpts {
     /// This is the TOTAL budget and it INCLUDES the radix sort's scratch
     /// buffer, which is the same size as the data being sorted. The usable
     /// run size is therefore HALF this value: `arcs_per_run = memory / (2 *
-    /// arc_size)`. Computing it without the factor 2 would make a nominal
-    /// 128 GiB budget cost 256 GiB of RSS and OOM on the first full-scale run.
+    /// 16)`, an arc being one 16-byte packed record. Computing it without the
+    /// factor 2 would make a nominal 128 GiB budget cost 256 GiB of RSS and
+    /// OOM on the first full-scale run.
     ///
     /// Default: min(45% of total RAM, 192GiB).
     #[arg(long, global = true, value_name = "SIZE", value_parser = crate::parse_memory_spec)]
@@ -111,7 +125,7 @@ pub struct CommonOpts {
     /// accumulate: `1d2h3m4s567`.
     // Upstream webgraph-rs flattens a per-subcommand `LogIntervalArg` instead.
     // `global = true` is a deliberate divergence: every other field of this
-    // struct is global, so `pgraph --log-interval 1m build 15` and `pgraph
+    // struct is global, so `utxo2webgraph --log-interval 1m build 15` and `utxo2webgraph
     // build 15 --log-interval 1m` must mean the same thing, and there is no
     // stage whose progress interval would sensibly differ from the run's.
     #[arg(long, global = true, value_name = "DURATION", value_parser = parse_duration, default_value = "10s")]
@@ -123,9 +137,12 @@ pub struct CommonOpts {
 
     /// Statistics style on stdout.
     ///
-    /// `java` reproduces the two lines of `PaymentGraphEdgeListBuilder`
-    /// byte-for-byte, including its mislabelled `Nodes:` counter.
-    #[arg(long, global = true, value_enum, default_value_t = StatsArg::Java)]
+    /// `brief` prints a `Processed:` line and then one tab-separated
+    /// `Nodes: N\tEdges: M` line, and nothing else. `extended` adds two more
+    /// tab-separated lines: the distinct-node count that `Nodes:` is commonly
+    /// mistaken for, and the skipped-line, blank-line, dangling-reference and
+    /// zero-output-transaction tallies.
+    #[arg(long, global = true, value_enum, default_value_t = StatsArg::Brief)]
     pub stats: StatsArg,
 }
 
@@ -151,16 +168,16 @@ pub enum Command {
     /// Split a transaction list into six-month chunks. Replaces `splitter.sh`.
     Split(SplitArgs),
 
-    /// Build the node map and the raw (unsorted) arc list.
-    /// Replaces `java -Xmx200g PaymentGraphEdgeListBuilder IN NM EL`.
+    /// Build the node map and the raw (unsorted) arc list from one or more
+    /// transaction lists.
     EdgeList(EdgeListArgs),
 
     /// Sort arcs by `(src, dst)` and remove duplicates.
     /// Replaces `sort -t$'\t' -k1,1n -k2,2n | uniq`.
     SortEdges(SortEdgesArgs),
 
-    /// Compress a sorted edge list into the BVGraph representation.
-    /// Replaces `java -Xmx200g -jar jar/WebgraphBuilder.jar EL PFX`.
+    /// Compress a sorted edge list into the BVGraph representation:
+    /// `PREFIX.graph`, `PREFIX.offsets` and `PREFIX.properties`.
     Compress(CompressArgs),
 
     /// edge-list + sort-edges + compress over one input. Replaces
@@ -170,7 +187,7 @@ pub enum Command {
 
     /// build-pg over chunks `1..N`, streamed. Replaces `builder.sh`.
     ///
-    /// `pgraph build 15` reads exactly like `./builder.sh 15` and produces the
+    /// `utxo2webgraph build 15` reads exactly like `./builder.sh 15` and produces the
     /// same names `build_pg.sh` derived — `graph/pg_nm_15.tsv`,
     /// `graph/pg_el_15.tsv`, `graph/pg_15.{graph,offsets,properties}` — but it
     /// streams the chunks instead of materialising a 23.9 GB (at N=15) or
@@ -180,7 +197,7 @@ pub enum Command {
 
 // ------------------------------------------------------------------ split
 
-/// Arguments of `pgraph split`. Replaces `splitter.sh`.
+/// Arguments of `utxo2webgraph split`. Replaces `splitter.sh`.
 #[derive(Args, Debug, Clone)]
 pub struct SplitArgs {
     /// Path to the master transaction list (e.g. `finalBCUTXO_2022`).
@@ -259,7 +276,7 @@ pub struct InputSelector {
     pub chunk_dir: Option<PathBuf>,
 }
 
-/// Arguments of `pgraph edge-list`. Replaces `PaymentGraphEdgeListBuilder`.
+/// Arguments of `utxo2webgraph edge-list`.
 #[derive(Args, Debug, Clone)]
 pub struct EdgeListArgs {
     /// Where the transactions come from.
@@ -278,14 +295,11 @@ pub struct EdgeListArgs {
     #[arg(long, value_name = "FILE")]
     pub arcs: PathBuf,
 
-    /// `binary` = little-endian packed arcs (half the size, no reparsing);
-    /// `tsv` = `src \t dst` text, byte-compatible with `tmp/edge_list.tsv`.
+    /// `binary` = little-endian 16-byte packed arcs, fixed width, read back
+    /// without re-parsing a digit; `tsv` = `src \t dst` decimal text,
+    /// byte-compatible with `tmp/edge_list.tsv`.
     #[arg(long, value_enum, default_value_t = ArcFormatArg::Binary)]
     pub arc_format: ArcFormatArg,
-
-    /// Arc representation for `--arc-format binary`.
-    #[arg(long, value_enum, default_value_t = ArcCodecArg::Packed32)]
-    pub arc_codec: ArcCodecArg,
 
     /// Pre-size the dense node map (default: grow geometrically).
     #[arg(long, value_name = "N")]
@@ -295,14 +309,14 @@ pub struct EdgeListArgs {
     #[arg(long, value_enum, default_value_t = OnMissingSourceArg::Fail)]
     pub on_missing_source: OnMissingSourceArg,
 
-    /// Emit a `Processed:` line every N transactions, as Java did.
+    /// Emit a `Processed:` line every N transactions.
     #[arg(long, value_name = "N", default_value_t = crate::DEFAULT_PROGRESS_EVERY)]
     pub progress_every: u64,
 }
 
 // ------------------------------------------------------------- sort-edges
 
-/// Arguments of `pgraph sort-edges`. Replaces `sort | uniq`.
+/// Arguments of `utxo2webgraph sort-edges`. Replaces `sort | uniq`.
 #[derive(Args, Debug, Clone)]
 pub struct SortEdgesArgs {
     /// Raw arc file produced by `edge-list`.
@@ -326,10 +340,6 @@ pub struct SortEdgesArgs {
     #[arg(long, value_enum, default_value_t = SortAlgoArg::Radix)]
     pub sort_algo: SortAlgoArg,
 
-    /// Arc representation. `packed32` requires every node id below 2^32.
-    #[arg(long, value_enum, default_value_t = ArcCodecArg::Packed32)]
-    pub arc_codec: ArcCodecArg,
-
     /// Keep duplicate arcs. The shell pipeline always removed them, and a
     /// duplicate arc is FATAL to the compressor, so this is for diagnosis only.
     #[arg(long)]
@@ -338,7 +348,7 @@ pub struct SortEdgesArgs {
 
 // --------------------------------------------------------------- compress
 
-/// Arguments of `pgraph compress`. Replaces `WebgraphBuilder.jar`.
+/// Arguments of `utxo2webgraph compress`.
 #[derive(Args, Debug, Clone)]
 pub struct CompressArgs {
     /// Sorted edge list: `.tsv` text or binary packed arcs.
@@ -356,19 +366,16 @@ pub struct CompressArgs {
     #[arg(long, value_enum, default_value_t = InputFormatArg::Auto)]
     pub input_format: InputFormatArg,
 
-    /// Arc representation for a binary input.
-    #[arg(long, value_enum, default_value_t = ArcCodecArg::Packed32)]
-    pub arc_codec: ArcCodecArg,
-
     /// How to determine the node count: `from-arcs`, `node-map`, or a literal
     /// integer.
     ///
-    /// `from-arcs` (the default) reproduces `ArcListASCIIGraph`'s `max(id over
-    /// sources AND targets) + 1`, which is what `WebgraphBuilder.jar` fed to
-    /// BVGraph and therefore what makes this command bit-compatible with the
-    /// shell pipeline. `node-map` is the semantically complete answer — every
-    /// UTXO is a node, including the unspent ones that appear in no arc — and
-    /// needs `--node-map FILE`. Both values are logged whenever they differ.
+    /// `from-arcs` (the default) is `max(id over sources AND targets) + 1`:
+    /// the smallest node count the arcs themselves justify, and the count the
+    /// historical shell pipeline produced, so a graph built this way is
+    /// directly comparable with the ones already on disk. `node-map` is the
+    /// semantically complete answer — every UTXO is a node, including the
+    /// unspent ones that appear in no arc — and needs `--node-map FILE`. Both
+    /// values are logged whenever they differ.
     #[arg(long, value_name = "SPEC", default_value = "from-arcs",
           value_parser = parse_num_nodes)]
     pub num_nodes: NumNodesSpec,
@@ -380,8 +387,8 @@ pub struct CompressArgs {
     /// Compress in parallel.
     ///
     /// Faster, but each chunk restarts its compression window, so the bytes
-    /// differ from the sequential (and Java-identical) output. Semantically
-    /// identical: `graph::eq` passes.
+    /// differ from the sequential output, which is the one that reproduces the
+    /// graphs already on disk. Semantically identical: `graph::eq` passes.
     #[arg(long)]
     pub parallel: bool,
 
@@ -400,7 +407,7 @@ pub struct CompressArgs {
 
 // --------------------------------------------------------------- build-pg
 
-/// Arguments of `pgraph build-pg`. Replaces `build_pg.sh`, fused.
+/// Arguments of `utxo2webgraph build-pg`. Replaces `build_pg.sh`, fused.
 #[derive(Args, Debug, Clone)]
 pub struct BuildPgArgs {
     /// Where the transactions come from.
@@ -435,10 +442,6 @@ pub struct BuildPgArgs {
     #[arg(long, value_enum, default_value_t = SortAlgoArg::Radix)]
     pub sort_algo: SortAlgoArg,
 
-    /// Arc representation.
-    #[arg(long, value_enum, default_value_t = ArcCodecArg::Packed32)]
-    pub arc_codec: ArcCodecArg,
-
     /// Pre-size the dense node map.
     #[arg(long, value_name = "N")]
     pub max_tx_id: Option<usize>,
@@ -454,7 +457,7 @@ pub struct BuildPgArgs {
           value_parser = parse_num_nodes)]
     pub num_nodes: NumNodesSpec,
 
-    /// Emit a `Processed:` line every N transactions, as Java did.
+    /// Emit a `Processed:` line every N transactions.
     #[arg(long, value_name = "N", default_value_t = crate::DEFAULT_PROGRESS_EVERY)]
     pub progress_every: u64,
 
@@ -473,7 +476,7 @@ pub struct BuildPgArgs {
 
 // ------------------------------------------------------------------ build
 
-/// Arguments of `pgraph build N`. Replaces `builder.sh N`.
+/// Arguments of `utxo2webgraph build N`. Replaces `builder.sh N`.
 #[derive(Args, Debug, Clone)]
 pub struct BuildArgs {
     /// Number of leading chunks, exactly like `./builder.sh N`.
@@ -500,10 +503,6 @@ pub struct BuildArgs {
     #[arg(long, value_enum, default_value_t = SortAlgoArg::Radix)]
     pub sort_algo: SortAlgoArg,
 
-    /// Arc representation.
-    #[arg(long, value_enum, default_value_t = ArcCodecArg::Packed32)]
-    pub arc_codec: ArcCodecArg,
-
     /// Pre-size the dense node map to N transactions (default: grow
     /// geometrically, which costs about 1.35x the steady-state array while it
     /// doubles).
@@ -521,7 +520,7 @@ pub struct BuildArgs {
           value_parser = parse_num_nodes)]
     pub num_nodes: NumNodesSpec,
 
-    /// Emit a `Processed:` line every N transactions, as Java did.
+    /// Emit a `Processed:` line every N transactions.
     #[arg(long, value_name = "N", default_value_t = crate::DEFAULT_PROGRESS_EVERY)]
     pub progress_every: u64,
 
@@ -548,7 +547,7 @@ pub struct BuildArgs {
 /// CLI mirror of [`Mode`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 pub enum ModeArg {
-    /// Any malformed record is fatal, as the Java program effectively was.
+    /// Any malformed record is a fatal, line-numbered error (the default).
     Strict,
     /// Malformed records are skipped and tallied.
     Lenient,
@@ -566,7 +565,8 @@ impl From<ModeArg> for Mode {
 /// CLI mirror of [`OnMissingSource`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 pub enum OnMissingSourceArg {
-    /// Abort, as Java's `NullPointerException` did.
+    /// Abort, naming the line, the transaction, the input index and the
+    /// missing `(prevTxId, prevOffset)` pair.
     Fail,
     /// Emit no edges for that input and tally it.
     Skip,
@@ -587,16 +587,29 @@ impl From<OnMissingSourceArg> for OnMissingSource {
 /// CLI mirror of [`StatsStyle`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 pub enum StatsArg {
-    /// The two Java lines, byte-for-byte.
-    Java,
-    /// The Java lines plus corrected and extra counters.
+    /// A `Processed:` line, then `Nodes: N\tEdges: M`, and nothing else.
+    ///
+    /// `Nodes:` counts output *slots* rather than distinct nodes — the two
+    /// differ whenever a transaction declares an output nothing ever spends —
+    /// and is reported that way for continuity with the historical pipeline
+    /// logs in `logs/pg_el_builder.log`, so a naive diff against them still
+    /// matches. Both numbers are on one tab-separated line, so parse the line
+    /// rather than expecting `Edges:` at the start of one.
+    Brief,
+    /// The `brief` lines plus two more, also tab-separated:
+    /// `Distinct nodes:`/`Output slots:`, and `Skipped lines:`/`Blank lines:`/
+    /// `Dangling refs:`/`Zero-output txs:`.
+    ///
+    /// The duplicate-arc tally is *not* here: deduplication happens in the
+    /// sorter, after these statistics are produced, and is reported on stderr
+    /// at `WARN` when it is ever non-zero.
     Extended,
 }
 
 impl From<StatsArg> for StatsStyle {
     fn from(a: StatsArg) -> StatsStyle {
         match a {
-            StatsArg::Java => StatsStyle::Java,
+            StatsArg::Brief => StatsStyle::Brief,
             StatsArg::Extended => StatsStyle::Extended,
         }
     }
@@ -624,28 +637,10 @@ impl From<VerifyArg> for VerifyLevel {
     }
 }
 
-/// CLI mirror of [`ArcCodec`].
-#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
-pub enum ArcCodecArg {
-    /// One `u64` per arc, `(src << 32) | dst`.
-    Packed32,
-    /// One `u128` per arc; always safe, twice the size.
-    Wide,
-}
-
-impl From<ArcCodecArg> for ArcCodec {
-    fn from(a: ArcCodecArg) -> ArcCodec {
-        match a {
-            ArcCodecArg::Packed32 => ArcCodec::Packed32,
-            ArcCodecArg::Wide => ArcCodec::Wide,
-        }
-    }
-}
-
 /// CLI mirror of [`SortAlgo`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 pub enum SortAlgoArg {
-    /// `rdst` LSD radix sort over packed `u64`.
+    /// `rdst` LSD radix sort over packed `u128` arcs.
     Radix,
     /// `rayon` pattern-defeating quicksort.
     Pdq,
@@ -666,7 +661,7 @@ impl From<SortAlgoArg> for SortAlgo {
 /// `arcs::TsvArcSink` and `arcs::BinaryArcSink`, which `main.rs` does directly.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 pub enum ArcFormatArg {
-    /// Fixed-width binary records; half the bytes and no reparsing.
+    /// Fixed-width 16-byte binary records, read back without re-parsing.
     Binary,
     /// `src \t dst` decimal text, byte-compatible with `tmp/edge_list.tsv`.
     Tsv,
@@ -683,7 +678,7 @@ pub enum InputFormatArg {
     Tsv,
 }
 
-/// The stage `pgraph build --from-stage` resumes at.
+/// The stage `utxo2webgraph build --from-stage` resumes at.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 pub enum StageArg {
     /// Parse the transactions from scratch (the default).
@@ -701,8 +696,8 @@ pub enum StageArg {
 pub enum NumNodesSpec {
     /// `node_map.next_id()`: every UTXO is a node. Semantically complete.
     NodeMap,
-    /// `max(src, dst) + 1`, reproducing `ArcListASCIIGraph`. Smaller, because
-    /// unspent outputs never appear in an arc.
+    /// `max(src, dst) + 1`: only the outputs some arc touches. Smaller than
+    /// [`NumNodesSpec::NodeMap`], because unspent outputs appear in no arc.
     FromArcs,
     /// A literal node count.
     Explicit(usize),
@@ -731,11 +726,12 @@ pub fn parse_num_nodes(s: &str) -> Result<NumNodesSpec, String> {
 /// Parses `--log-interval`.
 ///
 /// A port of webgraph-rs `cli/src/lib.rs`, so a duration accepted by
-/// `webgraph` is accepted here and means the same thing. For compatibility
-/// with the Java pipeline a bare number is **milliseconds**; the suffixes are
-/// `s` (seconds), `m` (minutes), `h` (hours) and `d` (days), and they
-/// accumulate: `1d2h3m4s567` is one day, two hours, three minutes, four
-/// seconds and 567 milliseconds.
+/// `webgraph` is accepted here and means the same thing — which is why a bare
+/// number is **milliseconds** and not seconds: keeping upstream's convention
+/// is the only way `--log-interval 500` cannot mean two different things to
+/// the two tools. The suffixes are `s` (seconds), `m` (minutes), `h` (hours)
+/// and `d` (days), and they accumulate: `1d2h3m4s567` is one day, two hours,
+/// three minutes, four seconds and 567 milliseconds.
 ///
 /// Private, exactly as upstream has it: `clap`'s `value_parser` does not need
 /// a public function, and widening the library's API would oblige it to carry
@@ -809,7 +805,7 @@ mod tests {
             parse_duration("1d2h3m4s567").unwrap(),
             Duration::from_secs(((24 + 2) * 60 + 3) * 60 + 4) + Duration::from_millis(567)
         );
-        // A bare number is MILLISECONDS, not seconds: Java compatibility.
+        // A bare number is MILLISECONDS, not seconds, as upstream has it.
         assert_eq!(parse_duration("500").unwrap(), Duration::from_millis(500));
         assert_eq!(parse_duration("10s").unwrap(), Duration::from_secs(10));
         assert_eq!(parse_duration("0").unwrap(), Duration::ZERO);
@@ -821,27 +817,27 @@ mod tests {
 
     #[test]
     fn log_interval_is_global_and_defaults_to_ten_seconds() {
-        let before = Cli::try_parse_from(["pgraph", "--log-interval", "1m5s", "build", "1"])
+        let before = Cli::try_parse_from(["utxo2webgraph", "--log-interval", "1m5s", "build", "1"])
             .expect("--log-interval before the subcommand");
-        let after = Cli::try_parse_from(["pgraph", "build", "1", "--log-interval", "1m5s"])
+        let after = Cli::try_parse_from(["utxo2webgraph", "build", "1", "--log-interval", "1m5s"])
             .expect("--log-interval after the subcommand");
         assert_eq!(before.common.log_interval, Duration::from_secs(65));
         assert_eq!(after.common.log_interval, before.common.log_interval);
 
-        let default = Cli::try_parse_from(["pgraph", "build", "1"]).expect("defaults");
+        let default = Cli::try_parse_from(["utxo2webgraph", "build", "1"]).expect("defaults");
         assert_eq!(default.common.log_interval, Duration::from_secs(10));
     }
 
     #[test]
     fn strict_and_lenient_conflict() {
-        let err = Cli::try_parse_from(["pgraph", "--strict", "--lenient", "build", "1"]);
+        let err = Cli::try_parse_from(["utxo2webgraph", "--strict", "--lenient", "build", "1"]);
         assert!(err.is_err(), "--strict --lenient must be rejected");
     }
 
     #[test]
     fn chunk_dir_requires_chunks() {
         let err = Cli::try_parse_from([
-            "pgraph",
+            "utxo2webgraph",
             "edge-list",
             "--chunk-dir",
             "chunks",
@@ -854,7 +850,7 @@ mod tests {
         );
 
         let ok = Cli::try_parse_from([
-            "pgraph",
+            "utxo2webgraph",
             "edge-list",
             "--chunk-dir",
             "chunks",
@@ -868,7 +864,7 @@ mod tests {
 
     #[test]
     fn global_options_may_precede_the_subcommand() {
-        let cli = Cli::try_parse_from(["pgraph", "--threads", "64", "build", "15"])
+        let cli = Cli::try_parse_from(["utxo2webgraph", "--threads", "64", "build", "15"])
             .expect("global option before the subcommand must parse");
         assert_eq!(cli.common.threads, Some(64));
         match cli.command {
@@ -876,6 +872,6 @@ mod tests {
             ref other => panic!("expected `build`, got {other:?}"),
         }
         assert_eq!(cli.common.mode(), Mode::Strict);
-        assert_eq!(cli.common.stats_style(), StatsStyle::Java);
+        assert_eq!(cli.common.stats_style(), StatsStyle::Brief);
     }
 }

@@ -1,6 +1,12 @@
 //! Arc storage, sorting and deduplication. Replaces the
 //! `sort --temporary-directory=./tmp -t$'\t' -k1,1n -k2,2n | uniq` stage of
-//! `build_pg.sh` by **Matteo Loporchio**.
+//! `build_pg.sh`.
+//!
+//! # Attribution
+//!
+//! The pipeline this stage belongs to, and the graph-construction algorithm it
+//! serves, are the work of **Matteo Loporchio**; what follows is an independent
+//! reimplementation of that design.
 //!
 //! # Why not shell out to GNU `sort`
 //!
@@ -25,23 +31,46 @@
 //!
 //! # Sorting an arc is sorting one integer
 //!
-//! [`crate::pack_arc`] maps `(src, dst)` to `(src << 32) | dst`. Sorting those
-//! `u64`s ascending is *exactly* `sort -t$'\t' -k1,1n -k2,2n`, and
-//! [`Vec::dedup`] on the sorted vector is *exactly* `uniq` — with the bonus
+//! [`crate::pack_arc`] maps `(src, dst)` to the `u128` `(src << 64) | dst`.
+//! Sorting those values ascending is *exactly* `sort -t$'\t' -k1,1n -k2,2n`,
+//! and [`Vec::dedup`] on the sorted vector is *exactly* `uniq` — with the bonus
 //! that numerically equal but textually different records (`007\t5` versus
-//! `7\t5`, which survive `sort | uniq` and are then fatal to the Java BVGraph
-//! loader) cannot exist at all.
+//! `7\t5`, which compare equal to `sort` yet both survive `uniq`, and then
+//! reach the graph writer as two copies of one arc, where a duplicate is fatal)
+//! cannot exist at all.
+//!
+//! # No ceiling, at sixteen bytes an arc
+//!
+//! The packing is **total**: every [`crate::NodeId`] pair is representable, so
+//! there is no id the sorter can refuse, no ceiling to test on the hot path,
+//! and no run that can die part-way through because the corpus outgrew the arc
+//! representation. The previous scheme squeezed the pair into a `u64` as
+//! `(src << 32) | dst`, which capped a node id at `2^32` — a cap this corpus
+//! was already within a factor of two of reaching, and one that could only be
+//! discovered hours into a run, with most of the arcs already written.
+//!
+//! The price is exact and accepted: an arc costs 16 bytes in memory and on disk
+//! rather than 8. A given memory budget therefore holds **half** as many arcs
+//! per run, so a spilling sort writes twice the bytes in twice as many runs.
+//! Buying an unconditional guarantee for a factor of two in a stage that is
+//! sequential I/O either way is the better trade.
 //!
 //! # Run sizing, and the trap to avoid
 //!
 //! ```text
-//! arcs_per_run = memory_bytes / (2 * codec.record_size())
+//! arcs_per_run = memory_bytes / (2 * ARC_RECORD_SIZE)
 //! ```
 //!
 //! The factor two is the radix sort's scratch buffer: `rdst`'s LSD radix
 //! allocates a second buffer the same size as the data. Computing
-//! `memory_bytes / record_size` instead would make a nominal 128 GiB budget
+//! `memory_bytes / ARC_RECORD_SIZE` instead would make a nominal 128 GiB budget
 //! cost 256 GiB of resident memory and OOM on the first full-scale run.
+//!
+//! [`crate::ARC_RECORD_SIZE`] is 16, so a nominal 128 GiB budget buffers
+//! `128 * 2^30 / 32 = 4.29e9` arcs per run. The same budget bought `8.59e9`
+//! when an arc was eight bytes wide, so against the `9.5e9` arcs of an
+//! `N = 28` run expect roughly twice the runs and twice the spilled bytes as
+//! before — or raise `--memory` to compensate.
 //!
 //! # Expected dedup yield: zero
 //!
@@ -64,8 +93,8 @@ use dsi_progress_logger::prelude::*;
 use log::{debug, info, warn};
 
 use crate::{
-    new_error_slot, pack_arc, sync_if_durable, take_iter_error, ArcCodec, ArcSink, ErrorSlot,
-    NodeId, PgError, PgResult, SortAlgo,
+    new_error_slot, pack_arc, sync_if_durable, take_iter_error, unpack_arc, ArcSink, Error,
+    ErrorSlot, NodeId, Result, SortAlgo, ARC_RECORD_SIZE,
 };
 
 /// Size of every `BufReader`/`BufWriter` in this module.
@@ -97,18 +126,24 @@ const INITIAL_ARCS_CAPACITY: usize = 1 << 20;
 /// Configuration for [`ArcSorter`] and [`sort_file`].
 #[derive(Clone, Debug)]
 pub struct SortOpts {
-    /// Run-sorting backend. [`SortAlgo::Radix`] is silently downgraded to
-    /// [`SortAlgo::Pdq`] when `codec` is [`ArcCodec::Wide`]; see
-    /// [`ArcSorter::effective_algo`].
+    /// Run-sorting backend. Both variants are valid for every arc, and the
+    /// request is always honoured: `rdst` implements `RadixKey` for `u128`, so
+    /// [`SortAlgo::Radix`] applies directly to a packed arc and is never
+    /// downgraded.
+    ///
+    /// The cost is worth stating plainly. A 16-byte key is **sixteen**
+    /// one-byte LSD passes, not the eight an 8-byte key needed, over records
+    /// that are themselves twice as wide — so the radix sort moves four times
+    /// the bytes it used to. It is still the default, because those passes are
+    /// linear and branch-free; [`SortAlgo::Pdq`] stays available as the
+    /// cross-check that reaches the same order by a different route.
     pub algo: SortAlgo,
-    /// In-memory and on-disk arc representation.
-    pub codec: ArcCodec,
     /// Remove duplicate arcs, reproducing the `uniq` of `build_pg.sh`.
     ///
-    /// A duplicate arc is *fatal* to the Java `it.unimi.dsi.webgraph` loader
-    /// (`BVGraph.updateBins` computes `mostSignificantBit(0) == -1` and dies
-    /// with `ArrayIndexOutOfBoundsException: Index -1`), so this should stay
-    /// `true` for anything that will be compressed.
+    /// A duplicate arc is *fatal* to the graph writer: a node's successors are
+    /// stored as a gap sequence, and a repeated `(src, dst)` produces a zero
+    /// gap, whose most-significant-bit has no answer. Keep this `true` for
+    /// anything that will be compressed.
     pub dedup: bool,
     /// Total memory budget for one sort run, **including** the radix sort's
     /// scratch buffer. See the module documentation for the arithmetic.
@@ -132,7 +167,6 @@ impl Default for SortOpts {
     fn default() -> Self {
         SortOpts {
             algo: SortAlgo::default(),
-            codec: ArcCodec::default(),
             dedup: true,
             memory_bytes: 256 << 20,
             tmp_dir: PathBuf::from("./tmp"),
@@ -166,11 +200,12 @@ pub struct SortStats {
 /// A buffered output file that only becomes visible under its final name once
 /// it has been fully written, flushed and `fsync`ed.
 ///
-/// The Java program opened both of its outputs with `new PrintWriter(String)`,
-/// which truncates at open and before any parsing: a crash on line 1 destroyed
-/// the previous good output (observed — `nm_02.tsv` and `el_02.tsv` are both
-/// 0 bytes in the reference directory). Writing to a sibling temporary path and
-/// renaming on success makes that impossible.
+/// The obvious implementation — open the destination, then start parsing —
+/// truncates that destination at open, before a single record has been
+/// validated, so a crash on line 1 destroys the previous good output. That is
+/// not hypothetical: it is how `nm_02.tsv` and `el_02.tsv` both came to be
+/// 0 bytes in the reference directory. Writing to a sibling temporary path and
+/// renaming on success makes it impossible.
 ///
 /// Non-regular destinations (`/dev/null`, a fifo, a process substitution) are
 /// written through directly, because renaming over them would be wrong.
@@ -181,13 +216,13 @@ struct AtomicOut {
 }
 
 impl AtomicOut {
-    fn create(path: &Path) -> PgResult<Self> {
+    fn create(path: &Path) -> Result<Self> {
         let direct = match std::fs::metadata(path) {
             Ok(md) => !md.is_file(),
             Err(_) => false,
         };
         if direct {
-            let file = File::create(path).map_err(|e| PgError::io(path, e))?;
+            let file = File::create(path).map_err(|e| Error::io(path, e))?;
             return Ok(AtomicOut {
                 final_path: path.to_path_buf(),
                 temp_path: None,
@@ -195,18 +230,18 @@ impl AtomicOut {
             });
         }
         let name = path.file_name().ok_or_else(|| {
-            PgError::other(format!("{} has no file name component", path.display()))
+            Error::other(format!("{} has no file name component", path.display()))
         })?;
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
         if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).map_err(|e| PgError::io(parent, e))?;
+            std::fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
         }
         let temp = parent.join(format!(
-            ".{}.pgraph-tmp-{}",
+            ".{}.utxo2webgraph-tmp-{}",
             name.to_string_lossy(),
             std::process::id()
         ));
-        let file = File::create(&temp).map_err(|e| PgError::io(&temp, e))?;
+        let file = File::create(&temp).map_err(|e| Error::io(&temp, e))?;
         Ok(AtomicOut {
             final_path: path.to_path_buf(),
             temp_path: Some(temp),
@@ -221,19 +256,19 @@ impl AtomicOut {
     /// that is `9.5e9` `malloc`/`memcpy`/`free` triples, measured at 6.67x the
     /// cost of the write itself (10.00 s versus 1.50 s over 50 000 000 arcs).
     #[inline]
-    fn write_all(&mut self, bytes: &[u8]) -> PgResult<()> {
+    fn write_all(&mut self, bytes: &[u8]) -> Result<()> {
         let w = self
             .writer
             .as_mut()
             .expect("AtomicOut used after commit; this is a bug in utxo2webgraph");
         match w.write_all(bytes) {
             Ok(()) => Ok(()),
-            Err(e) => Err(PgError::io(&self.final_path, e)),
+            Err(e) => Err(Error::io(&self.final_path, e)),
         }
     }
 
     /// Flushes, `fsync`s and publishes the file under its final name.
-    fn commit(&mut self) -> PgResult<()> {
+    fn commit(&mut self) -> Result<()> {
         let Some(mut writer) = self.writer.take() else {
             return Ok(());
         };
@@ -241,14 +276,14 @@ impl AtomicOut {
             .temp_path
             .clone()
             .unwrap_or_else(|| self.final_path.clone());
-        writer.flush().map_err(|e| PgError::io(&written_path, e))?;
+        writer.flush().map_err(|e| Error::io(&written_path, e))?;
         // Not `sync_all` directly: `fsync` on `/dev/null`, a fifo or a process
         // substitution returns EINVAL, which used to fail an otherwise
         // completed run.
         sync_if_durable(writer.get_ref(), &written_path)?;
         drop(writer);
         if let Some(temp) = self.temp_path.take() {
-            std::fs::rename(&temp, &self.final_path).map_err(|e| PgError::io(&temp, e))?;
+            std::fs::rename(&temp, &self.final_path).map_err(|e| Error::io(&temp, e))?;
             // Best effort: make the rename itself durable. A failure here is
             // not worth aborting a completed multi-hour run over.
             if let Some(parent) = self.final_path.parent() {
@@ -270,7 +305,7 @@ impl Drop for AtomicOut {
     /// Removes the temporary file when the output was never committed.
     ///
     /// Without this, every failed run left its partial output behind under
-    /// `.<name>.pgraph-tmp-<pid>` — up to 195 GiB at `N = 28`, and, because the
+    /// `.<name>.utxo2webgraph-tmp-<pid>` — up to 195 GiB at `N = 28`, and, because the
     /// name carries the pid, a *new* orphan on every retry.
     fn drop(&mut self) {
         if self.writer.is_none() {
@@ -311,12 +346,12 @@ impl NullArcSink {
 
 impl ArcSink for NullArcSink {
     #[inline]
-    fn push(&mut self, _src: NodeId, _dst: NodeId) -> PgResult<()> {
+    fn push(&mut self, _src: NodeId, _dst: NodeId) -> Result<()> {
         self.count += 1;
         Ok(())
     }
 
-    fn finish(&mut self) -> PgResult<()> {
+    fn finish(&mut self) -> Result<()> {
         Ok(())
     }
 }
@@ -325,9 +360,10 @@ impl ArcSink for NullArcSink {
 ///
 /// The formatting is **canonical and load-bearing**: decimal, no padding, no
 /// sign, no leading zeros, a single TAB, LF only. `007\t5` and `7\t5` compare
-/// equal under `sort -k1,1n -k2,2n` yet survive `uniq`, and a duplicate arc is
-/// fatal to the Java BVGraph loader. This reproduces Java's
-/// `printf("%d\t%d\n", ...)` byte for byte.
+/// equal under `sort -k1,1n -k2,2n` yet both survive `uniq`, and a duplicate
+/// arc is fatal to the graph writer — so exactly one spelling of an arc may
+/// ever be emitted. It is also the byte-for-byte format of the historical edge
+/// lists, which the golden tests pin by md5.
 ///
 /// Integers are rendered with [`itoa`], not `write!`: at `9.5e9` lines
 /// `std::fmt`'s per-call overhead is the difference between minutes and an
@@ -341,7 +377,7 @@ pub struct TsvArcSink {
 impl TsvArcSink {
     /// Creates the sink. The destination only appears under `path` once
     /// [`ArcSink::finish`] has succeeded.
-    pub fn create(path: &Path) -> PgResult<Self> {
+    pub fn create(path: &Path) -> Result<Self> {
         Ok(TsvArcSink {
             out: AtomicOut::create(path)?,
             itoa: itoa::Buffer::new(),
@@ -357,7 +393,7 @@ impl TsvArcSink {
 
 impl ArcSink for TsvArcSink {
     #[inline]
-    fn push(&mut self, src: NodeId, dst: NodeId) -> PgResult<()> {
+    fn push(&mut self, src: NodeId, dst: NodeId) -> Result<()> {
         // Two itoa renderings plus two literal bytes; no formatting machinery,
         // and no allocation whatsoever on this path.
         let mut scratch = [0u8; 48];
@@ -381,27 +417,25 @@ impl ArcSink for TsvArcSink {
         Ok(())
     }
 
-    fn finish(&mut self) -> PgResult<()> {
+    fn finish(&mut self) -> Result<()> {
         self.out.commit()
     }
 }
 
-/// Writes arcs as raw little-endian fixed-width records with no header, so that
-/// `file length / record size` is the arc count and a torn write is detectable
-/// as a non-multiple length (see [`PgError::TruncatedRun`]).
+/// Writes arcs as raw little-endian [`ARC_RECORD_SIZE`]-byte records with no
+/// header, so that `file length / 16` is the arc count and a torn write is
+/// detectable as a non-multiple length (see [`Error::TruncatedRun`]).
 pub struct BinaryArcSink {
     out: AtomicOut,
-    codec: ArcCodec,
     count: u64,
 }
 
 impl BinaryArcSink {
     /// Creates the sink. The destination only appears under `path` once
     /// [`ArcSink::finish`] has succeeded.
-    pub fn create(path: &Path, codec: ArcCodec) -> PgResult<Self> {
+    pub fn create(path: &Path) -> Result<Self> {
         Ok(BinaryArcSink {
             out: AtomicOut::create(path)?,
-            codec,
             count: 0,
         })
     }
@@ -414,128 +448,59 @@ impl BinaryArcSink {
 
 impl ArcSink for BinaryArcSink {
     #[inline]
-    fn push(&mut self, src: NodeId, dst: NodeId) -> PgResult<()> {
-        match self.codec {
-            ArcCodec::Packed32 => {
-                let key = pack_arc(src, dst).ok_or(PgError::ArcCodecOverflow(src.max(dst)))?;
-                self.out.write_all(&key.to_le_bytes())?;
-            }
-            ArcCodec::Wide => {
-                let key = wide_arc(src, dst);
-                self.out.write_all(&key.to_le_bytes())?;
-            }
-        }
+    fn push(&mut self, src: NodeId, dst: NodeId) -> Result<()> {
+        // Total, so there is no width check and no error path here.
+        self.out.write_all(&pack_arc(src, dst).to_le_bytes())?;
         self.count += 1;
         Ok(())
     }
 
-    fn finish(&mut self) -> PgResult<()> {
+    fn finish(&mut self) -> Result<()> {
         self.out.commit()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Key helpers
-// ---------------------------------------------------------------------------
-
-/// Packs an arc into a `u128`: `(src << 64) | dst`. Always representable.
-#[inline]
-fn wide_arc(src: NodeId, dst: NodeId) -> u128 {
-    ((src as u128) << 64) | (dst as u128)
-}
-
-/// Unpacks a merge key. Merge keys are always `u128` so that one heap serves
-/// both codecs; a [`ArcCodec::Packed32`] key is the zero-extended `u64`.
-#[inline]
-fn unpack_key(codec: ArcCodec, key: u128) -> (usize, usize) {
-    match codec {
-        ArcCodec::Packed32 => (
-            ((key >> 32) as u64 & 0xFFFF_FFFF) as usize,
-            (key as u64 & 0xFFFF_FFFF) as usize,
-        ),
-        ArcCodec::Wide => ((key >> 64) as u64 as usize, (key as u64) as usize),
     }
 }
 
 // ---------------------------------------------------------------------------
 // The in-memory run buffer
 // ---------------------------------------------------------------------------
+//
+// The buffer is a plain `Vec<u128>` of packed arcs. There is exactly one arc
+// representation, so there is nothing to dispatch on and no enum to unwrap on
+// a path that runs `9.5e9` times.
 
-/// The buffer of not-yet-sorted arcs, in whichever width the codec asks for.
-enum ArcBuf {
-    Packed(Vec<u64>),
-    Wide(Vec<u128>),
+/// Sorts the run buffer and, optionally, deduplicates it in place. Returns how
+/// many duplicates were removed.
+fn sort_dedup(
+    v: &mut Vec<u128>,
+    algo: SortAlgo,
+    dedup: bool,
+    pool: Option<&rayon::ThreadPool>,
+) -> u64 {
+    let before = v.len() as u64;
+    sort_arcs(v, algo, pool);
+    if dedup {
+        v.dedup();
+    }
+    before - v.len() as u64
 }
 
-impl ArcBuf {
-    fn with_capacity(codec: ArcCodec, cap: usize) -> Self {
-        match codec {
-            ArcCodec::Packed32 => ArcBuf::Packed(Vec::with_capacity(cap)),
-            ArcCodec::Wide => ArcBuf::Wide(Vec::with_capacity(cap)),
-        }
+/// Writes every packed arc little-endian, returning the byte count. The buffer
+/// must already be sorted.
+fn write_arcs(v: &[u128], w: &mut impl Write) -> std::io::Result<u64> {
+    for k in v {
+        w.write_all(&k.to_le_bytes())?;
     }
-
-    #[inline]
-    fn len(&self) -> usize {
-        match self {
-            ArcBuf::Packed(v) => v.len(),
-            ArcBuf::Wide(v) => v.len(),
-        }
-    }
-
-    #[inline]
-    fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    /// Sorts, optionally deduplicates, and returns how many duplicates went.
-    fn sort_dedup(&mut self, algo: SortAlgo, dedup: bool, pool: Option<&rayon::ThreadPool>) -> u64 {
-        let before = self.len() as u64;
-        match self {
-            ArcBuf::Packed(v) => {
-                sort_u64(v, algo, pool);
-                if dedup {
-                    v.dedup();
-                }
-            }
-            ArcBuf::Wide(v) => {
-                sort_u128(v, pool);
-                if dedup {
-                    v.dedup();
-                }
-            }
-        }
-        before - self.len() as u64
-    }
-
-    /// Writes every record little-endian. The buffer must already be sorted.
-    fn write_to(&self, w: &mut impl Write) -> std::io::Result<u64> {
-        match self {
-            ArcBuf::Packed(v) => {
-                for k in v {
-                    w.write_all(&k.to_le_bytes())?;
-                }
-                Ok(v.len() as u64 * 8)
-            }
-            ArcBuf::Wide(v) => {
-                for k in v {
-                    w.write_all(&k.to_le_bytes())?;
-                }
-                Ok(v.len() as u64 * 16)
-            }
-        }
-    }
-
-    fn clear(&mut self) {
-        match self {
-            ArcBuf::Packed(v) => v.clear(),
-            ArcBuf::Wide(v) => v.clear(),
-        }
-    }
+    Ok(v.len() as u64 * ARC_RECORD_SIZE as u64)
 }
 
-/// Sorts `u64` keys with the requested backend.
-fn sort_u64(v: &mut Vec<u64>, algo: SortAlgo, pool: Option<&rayon::ThreadPool>) {
+/// Sorts packed arcs with the requested backend.
+///
+/// `rdst` implements `RadixKey` for `u128`, so [`SortAlgo::Radix`] sorts a
+/// packed arc directly: sixteen one-byte LSD passes rather than the eight an
+/// 8-byte key took. There is no downgrade and no special case — both backends
+/// produce the same ascending order, which is exactly what makes
+/// [`SortAlgo::Pdq`] a usable cross-check on a new corpus.
+fn sort_arcs(v: &mut Vec<u128>, algo: SortAlgo, pool: Option<&rayon::ThreadPool>) {
     match algo {
         SortAlgo::Radix => {
             use rdst::RadixSort;
@@ -543,15 +508,6 @@ fn sort_u64(v: &mut Vec<u64>, algo: SortAlgo, pool: Option<&rayon::ThreadPool>) 
         }
         SortAlgo::Pdq => sort_pdq(v.as_mut_slice(), pool),
     }
-}
-
-/// Sorts `u128` keys. Always pattern-defeating quicksort: `rdst` does
-/// implement `RadixKey` for `u128`, but that is sixteen LSD passes over
-/// 16-byte records, which loses to a comparison sort on the only path that
-/// ever uses this codec (a hypothetical future dataset with node ids past
-/// `2^32`). See [`ArcSorter::effective_algo`].
-fn sort_u128(v: &mut Vec<u128>, pool: Option<&rayon::ThreadPool>) {
-    sort_pdq(v.as_mut_slice(), pool)
 }
 
 fn sort_pdq<T: Ord + Send>(slice: &mut [T], pool: Option<&rayon::ThreadPool>) {
@@ -568,17 +524,22 @@ fn sort_pdq<T: Ord + Send>(slice: &mut [T], pool: Option<&rayon::ThreadPool>) {
 
 /// The [`ArcSink`] that replaces `sort | uniq`.
 ///
-/// Arcs are packed into one integer, buffered up to `arcs_per_run`, sorted with
+/// Arcs are packed into one `u128`, buffered up to `arcs_per_run`, sorted with
 /// [`SortOpts::algo`], deduplicated in place, and spilled to a fixed-width
 /// binary run. [`ArcSorter::into_sorted`] then either hands back the in-memory
-/// buffer (the common case on this machine: at `N = 28` a 128 GiB budget holds
-/// all `9.5e9` arcs in one run and nothing ever reaches the disk) or a k-way
-/// merge over the runs.
+/// buffer, when the whole sort fitted in the budget, or a k-way merge over the
+/// runs.
+///
+/// Staying in RAM is the fast path and is worth sizing for: at `N = 28`
+/// (`9.5e9` arcs, [`ARC_RECORD_SIZE`] bytes each, doubled for the radix
+/// scratch buffer) it takes a budget of about 283 GiB. Below that the run count
+/// is `ceil(9.5e9 / arcs_per_run)` and the merge path is simply the normal
+/// one — it is streaming sequential I/O, not a fallback to be feared.
 pub struct ArcSorter {
     opts: SortOpts,
     algo: SortAlgo,
     arcs_per_run: usize,
-    buf: ArcBuf,
+    buf: Vec<u128>,
     runs: Vec<PathBuf>,
     tmp: Option<tempfile::TempDir>,
     pool: Option<rayon::ThreadPool>,
@@ -591,16 +552,16 @@ impl ArcSorter {
     ///
     /// # Errors
     ///
-    /// Fails with [`PgError::Other`] when `memory_bytes` is so small that a run
-    /// would hold fewer than 1024 arcs, and with [`PgError::PlainIo`] when the
+    /// Fails with [`Error::Other`] when `memory_bytes` is so small that a run
+    /// would hold fewer than 1024 arcs, and with [`Error::PlainIo`] when the
     /// `rayon` pool for [`SortAlgo::Pdq`] cannot be built.
-    pub fn new(opts: SortOpts) -> PgResult<Self> {
-        let record = opts.codec.record_size() as u64;
+    pub fn new(opts: SortOpts) -> Result<Self> {
+        let record = ARC_RECORD_SIZE as u64;
         // The factor two is the radix sort's scratch buffer. Dropping it turns
         // a nominal 128 GiB budget into 256 GiB of resident memory.
         let arcs_per_run = (opts.memory_bytes / (2 * record)) as usize;
         if arcs_per_run < MIN_ARCS_PER_RUN {
-            return Err(PgError::other(format!(
+            return Err(Error::other(format!(
                 "memory budget of {} bytes only allows {} arcs per run (minimum {}); \
                  arcs_per_run = memory / (2 * {} bytes per arc), the factor 2 being the \
                  radix sort's scratch buffer",
@@ -608,19 +569,12 @@ impl ArcSorter {
             )));
         }
 
-        let algo = match (opts.algo, opts.codec) {
-            (SortAlgo::Radix, ArcCodec::Wide) => {
-                info!(
-                    "arc codec is 'wide' (128-bit): downgrading the run sort from radix to \
-                     pattern-defeating quicksort"
-                );
-                SortAlgo::Pdq
-            }
-            (a, _) => a,
-        };
+        // No dispatch and no downgrade: `rdst` sorts the 16-byte packed arc
+        // directly, so whichever backend was asked for is the one that runs.
+        let algo = opts.algo;
 
-        // Only the comparison sort takes a pool: `sort_u64`/`sort_u128` pass it
-        // to `sort_pdq` and nowhere else, because `rdst`'s radix sort follows
+        // Only the comparison sort takes a pool: `sort_arcs` passes it to
+        // `sort_pdq` and nowhere else, because `rdst`'s radix sort follows
         // the ambient (global) `rayon` pool and cannot be told about a private
         // one. Building it unconditionally spawned a second full set of
         // threads that never ran a task — 225 OS threads at `--threads 112`.
@@ -630,7 +584,7 @@ impl ArcSorter {
                     .num_threads(opts.threads)
                     .build()
                     .map_err(|e| {
-                        PgError::other(format!("could not build the sort thread pool: {e}"))
+                        Error::other(format!("could not build the sort thread pool: {e}"))
                     })?,
             )
         } else {
@@ -638,12 +592,12 @@ impl ArcSorter {
         };
 
         debug!(
-            "arc sorter: codec={:?} algo={:?} arcs_per_run={} memory={} bytes dedup={}",
-            opts.codec, algo, arcs_per_run, opts.memory_bytes, opts.dedup
+            "arc sorter: algo={:?} arcs_per_run={} memory={} bytes dedup={} record={} bytes",
+            algo, arcs_per_run, opts.memory_bytes, opts.dedup, ARC_RECORD_SIZE
         );
 
         Ok(ArcSorter {
-            buf: ArcBuf::with_capacity(opts.codec, arcs_per_run.min(INITIAL_ARCS_CAPACITY)),
+            buf: Vec::with_capacity(arcs_per_run.min(INITIAL_ARCS_CAPACITY)),
             opts,
             algo,
             arcs_per_run,
@@ -655,12 +609,18 @@ impl ArcSorter {
         })
     }
 
-    /// The backend actually in use, after the [`ArcCodec::Wide`] downgrade.
+    /// The backend actually in use.
+    ///
+    /// Always [`SortOpts::algo`] now that `rdst` sorts the 16-byte packed arc
+    /// directly. It did not used to be: the 128-bit representation forced a
+    /// downgrade to [`SortAlgo::Pdq`], and this accessor is how a caller found
+    /// out. It is kept so callers still have one place to ask what actually
+    /// ran, rather than assuming the request was honoured.
     pub fn effective_algo(&self) -> SortAlgo {
         self.algo
     }
 
-    /// Arcs buffered before a run is spilled: `memory / (2 * record_size)`.
+    /// Arcs buffered before a run is spilled: `memory / (2 * ARC_RECORD_SIZE)`.
     pub fn arcs_per_run(&self) -> usize {
         self.arcs_per_run
     }
@@ -673,9 +633,9 @@ impl ArcSorter {
     /// Directory the next run file will be created in, creating the private
     /// temporary directory on first use so that a fully in-memory sort never
     /// touches the filesystem at all.
-    fn run_dir(&mut self) -> PgResult<PathBuf> {
+    fn run_dir(&mut self) -> Result<PathBuf> {
         let base = &self.opts.tmp_dir;
-        std::fs::create_dir_all(base).map_err(|e| PgError::io(base, e))?;
+        std::fs::create_dir_all(base).map_err(|e| Error::io(base, e))?;
         if self.opts.keep_intermediate {
             return Ok(base.clone());
         }
@@ -686,9 +646,9 @@ impl ArcSorter {
                     // SIGINT/SIGKILL never runs `TempDir`'s destructor, and
                     // `reap_stale_run_dirs` uses the pid to tell an orphan
                     // from a directory a concurrent run is still using.
-                    .prefix(&format!("pgraph-sort-{}-", std::process::id()))
+                    .prefix(&format!("utxo2webgraph-sort-{}-", std::process::id()))
                     .tempdir_in(base)
-                    .map_err(|e| PgError::io(base, e))?,
+                    .map_err(|e| Error::io(base, e))?,
             );
         }
         Ok(self
@@ -700,24 +660,24 @@ impl ArcSorter {
     }
 
     /// Sorts, deduplicates and writes the buffer as one run file.
-    fn spill(&mut self) -> PgResult<()> {
+    fn spill(&mut self) -> Result<()> {
         if self.buf.is_empty() {
             return Ok(());
         }
-        let removed = self
-            .buf
-            .sort_dedup(self.algo, self.opts.dedup, self.pool.as_ref());
+        let removed = sort_dedup(
+            &mut self.buf,
+            self.algo,
+            self.opts.dedup,
+            self.pool.as_ref(),
+        );
         self.stats.duplicates_removed += removed;
 
         let dir = self.run_dir()?;
         let path = dir.join(format!("run-{:05}.arcs", self.runs.len()));
-        let file = File::create(&path).map_err(|e| PgError::io(&path, e))?;
+        let file = File::create(&path).map_err(|e| Error::io(&path, e))?;
         let mut w = BufWriter::with_capacity(IO_BUF, file);
-        let bytes = self
-            .buf
-            .write_to(&mut w)
-            .map_err(|e| PgError::io(&path, e))?;
-        w.flush().map_err(|e| PgError::io(&path, e))?;
+        let bytes = write_arcs(&self.buf, &mut w).map_err(|e| Error::io(&path, e))?;
+        w.flush().map_err(|e| Error::io(&path, e))?;
         sync_if_durable(w.get_ref(), &path)?;
         drop(w);
 
@@ -748,34 +708,30 @@ impl ArcSorter {
     /// one counting merge pass over the runs to make [`SortedArcs::num_arcs`]
     /// exact — the downstream BVGraph writer records an `arcs=` property and
     /// must not be told a guess. That extra pass is pure sequential I/O over
-    /// binary records and never happens in the single-run case, which is what
-    /// the production configuration on this machine always hits.
+    /// binary records and never happens in the single-run case — which, at
+    /// 16 bytes an arc, now needs about twice the budget it once did, so expect
+    /// to pay for the counting pass more often than before.
     ///
     /// `pl` is used only by that counting pass; pass `no_logging!()` when the
     /// caller does not care.
-    pub fn into_sorted(mut self, pl: &mut impl ProgressLog) -> PgResult<(SortedArcs, SortStats)> {
+    pub fn into_sorted(mut self, pl: &mut impl ProgressLog) -> Result<(SortedArcs, SortStats)> {
         if !self.finished {
             // Not fatal: `into_sorted` does everything `finish` would have.
             // Worth saying, because a caller that skipped `finish` on one sink
             // has probably skipped it on the others too, where it *is* fatal.
             debug!("ArcSorter::into_sorted called without a preceding finish()");
         }
-        let codec = self.opts.codec;
         let dedup = self.opts.dedup;
 
         if self.runs.is_empty() {
-            let removed = self.buf.sort_dedup(self.algo, dedup, self.pool.as_ref());
+            let removed = sort_dedup(&mut self.buf, self.algo, dedup, self.pool.as_ref());
             self.stats.duplicates_removed += removed;
             self.stats.distinct_arcs = self.buf.len() as u64;
-            let repr = match self.buf {
-                ArcBuf::Packed(v) => Repr::MemoryPacked(v),
-                ArcBuf::Wide(v) => Repr::MemoryWide(v),
-            };
+            let repr = Repr::Memory(self.buf);
             let stats = self.stats;
             report_duplicates(&stats);
             return Ok((
                 SortedArcs {
-                    codec,
                     dedup,
                     num_arcs: stats.distinct_arcs,
                     max_node_id: stats.max_node_id,
@@ -788,14 +744,14 @@ impl ArcSorter {
         self.spill()?;
         let runs = std::mem::take(&mut self.runs);
         let tmp = self.tmp.take();
-        let record = codec.record_size() as u64;
+        let record = ARC_RECORD_SIZE as u64;
 
         let num_arcs = if runs.len() == 1 {
             let len = std::fs::metadata(&runs[0])
-                .map_err(|e| PgError::io(&runs[0], e))?
+                .map_err(|e| Error::io(&runs[0], e))?
                 .len();
             if len % record != 0 {
-                return Err(PgError::TruncatedRun {
+                return Err(Error::TruncatedRun {
                     path: runs[0].clone(),
                     len,
                     record_size: record as usize,
@@ -807,7 +763,7 @@ impl ArcSorter {
                 "{} runs: counting distinct arcs with one merge pass to keep num_arcs exact",
                 runs.len()
             );
-            count_merged(&runs, codec, true, pl)?
+            count_merged(&runs, true, pl)?
         } else {
             self.stats.raw_arcs
         };
@@ -819,7 +775,6 @@ impl ArcSorter {
 
         Ok((
             SortedArcs {
-                codec,
                 dedup,
                 num_arcs,
                 max_node_id: stats.max_node_id,
@@ -848,18 +803,12 @@ fn report_duplicates(stats: &SortStats) {
 
 impl ArcSink for ArcSorter {
     #[inline]
-    fn push(&mut self, src: NodeId, dst: NodeId) -> PgResult<()> {
+    fn push(&mut self, src: NodeId, dst: NodeId) -> Result<()> {
         let hi = src.max(dst);
         if hi > self.stats.max_node_id {
             self.stats.max_node_id = hi;
         }
-        match &mut self.buf {
-            ArcBuf::Packed(v) => {
-                let key = pack_arc(src, dst).ok_or(PgError::ArcCodecOverflow(hi))?;
-                v.push(key);
-            }
-            ArcBuf::Wide(v) => v.push(wide_arc(src, dst)),
-        }
+        self.buf.push(pack_arc(src, dst));
         self.stats.raw_arcs += 1;
         if self.buf.len() >= self.arcs_per_run {
             self.spill()?;
@@ -870,7 +819,7 @@ impl ArcSink for ArcSorter {
     /// Marks the sorter complete. Every run written so far has already been
     /// flushed and `fsync`ed; the buffered tail is turned into sorted output by
     /// [`ArcSorter::into_sorted`], which is what callers must invoke next.
-    fn finish(&mut self) -> PgResult<()> {
+    fn finish(&mut self) -> Result<()> {
         self.finished = true;
         Ok(())
     }
@@ -881,8 +830,7 @@ impl ArcSink for ArcSorter {
 // ---------------------------------------------------------------------------
 
 enum Repr {
-    MemoryPacked(Vec<u64>),
-    MemoryWide(Vec<u128>),
+    Memory(Vec<u128>),
     Runs {
         paths: Vec<PathBuf>,
         /// Dropped last, deleting the run files, unless `keep_intermediate`.
@@ -893,11 +841,10 @@ enum Repr {
 /// A sorted, optionally deduplicated arc set: either a vector in memory or a
 /// set of on-disk runs merged lazily.
 ///
-/// This is exactly the contract `build_pg.sh` handed to WebGraph after
-/// `sort -t$'\t' -k1,1n -k2,2n | uniq`: ascending by `(src, dst)`, free of
-/// duplicates, self-loops preserved.
+/// This is exactly the contract `build_pg.sh` handed to the graph compressor
+/// after `sort -t$'\t' -k1,1n -k2,2n | uniq`: ascending by `(src, dst)`, free
+/// of duplicates, self-loops preserved.
 pub struct SortedArcs {
-    codec: ArcCodec,
     dedup: bool,
     num_arcs: u64,
     max_node_id: NodeId,
@@ -911,16 +858,11 @@ impl SortedArcs {
     }
 
     /// Largest node id seen on either endpoint. Note this is `max_id`, so a
-    /// graph covering exactly these arcs has `max_id + 1` nodes — which is what
-    /// Java's `ArcListASCIIGraph` inferred, and is generally *smaller* than the
-    /// node map's `next_id` because unspent outputs never appear in an arc.
+    /// graph covering exactly these arcs has `max_id + 1` nodes — the
+    /// `--num-nodes from-arcs` candidate, and generally *smaller* than the node
+    /// map's `next_id`, because an unspent output appears in no arc at all.
     pub fn max_node_id(&self) -> NodeId {
         self.max_node_id
-    }
-
-    /// The representation the arcs are stored in.
-    pub fn codec(&self) -> ArcCodec {
-        self.codec
     }
 
     /// Streams the arcs in ascending `(src, dst)` order.
@@ -932,25 +874,15 @@ impl SortedArcs {
     /// [`ErrorSlot`] and the iterator simply ends. **Callers must call
     /// [`crate::take_iter_error`] on the slot once the iterator is exhausted**,
     /// otherwise a truncated graph looks like a successful one.
-    pub fn iter(&self) -> PgResult<(SortedArcIter<'_>, ErrorSlot)> {
+    pub fn iter(&self) -> Result<(SortedArcIter<'_>, ErrorSlot)> {
         let slot = new_error_slot();
         let inner = match &self.repr {
-            Repr::MemoryPacked(v) => IterInner::Packed(v.iter()),
-            Repr::MemoryWide(v) => IterInner::Wide(v.iter()),
-            Repr::Runs { paths, .. } => IterInner::Merge(Box::new(Merger::open(
-                paths,
-                self.codec,
-                self.dedup,
-                slot.clone(),
-            )?)),
+            Repr::Memory(v) => IterInner::Memory(v.iter()),
+            Repr::Runs { paths, .. } => {
+                IterInner::Merge(Box::new(Merger::open(paths, self.dedup, slot.clone())?))
+            }
         };
-        Ok((
-            SortedArcIter {
-                codec: self.codec,
-                inner,
-            },
-            slot,
-        ))
+        Ok((SortedArcIter { inner }, slot))
     }
 
     /// Writes `graph/pg_el_N.tsv`: the sorted, deduplicated text edge list,
@@ -960,7 +892,7 @@ impl SortedArcs {
     /// this loop writes 195 GiB and used to take about ten minutes in total
     /// silence. [`num_arcs`](Self::num_arcs) is exact, so the logger is given
     /// an exact `expected_updates` and can show a percentage and an ETA.
-    pub fn write_tsv(&self, path: &Path, pl: &mut impl ProgressLog) -> PgResult<u64> {
+    pub fn write_tsv(&self, path: &Path, pl: &mut impl ProgressLog) -> Result<u64> {
         let (iter, slot) = self.iter()?;
         let mut sink = TsvArcSink::create(path)?;
         pl.item_name("arc");
@@ -970,7 +902,7 @@ impl SortedArcs {
             path.display()
         ));
         for (src, dst) in iter {
-            sink.push(src as NodeId, dst as NodeId)?;
+            sink.push(src, dst)?;
             pl.light_update();
         }
         take_iter_error(&slot)?;
@@ -983,14 +915,14 @@ impl SortedArcs {
     /// Returns the arc count.
     ///
     /// Progress goes to `pl`, as in [`write_tsv`](Self::write_tsv).
-    pub fn write_binary(&self, path: &Path, pl: &mut impl ProgressLog) -> PgResult<u64> {
+    pub fn write_binary(&self, path: &Path, pl: &mut impl ProgressLog) -> Result<u64> {
         let (iter, slot) = self.iter()?;
-        let mut sink = BinaryArcSink::create(path, self.codec)?;
+        let mut sink = BinaryArcSink::create(path)?;
         pl.item_name("arc");
         pl.expected_updates(Some(self.num_arcs as usize));
         pl.start(format!("Writing the binary arcs to {}...", path.display()));
         for (src, dst) in iter {
-            sink.push(src as NodeId, dst as NodeId)?;
+            sink.push(src, dst)?;
             pl.light_update();
         }
         take_iter_error(&slot)?;
@@ -1001,8 +933,7 @@ impl SortedArcs {
 }
 
 enum IterInner<'a> {
-    Packed(std::slice::Iter<'a, u64>),
-    Wide(std::slice::Iter<'a, u128>),
+    Memory(std::slice::Iter<'a, u128>),
     Merge(Box<Merger>),
 }
 
@@ -1013,18 +944,16 @@ enum IterInner<'a> {
 /// `BinaryHeap` and an `Arc<Mutex<..>>`), so `compress.rs` can move it into a
 /// [`rayon::ThreadPool::install`] closure.
 pub struct SortedArcIter<'a> {
-    codec: ArcCodec,
     inner: IterInner<'a>,
 }
 
 impl Iterator for SortedArcIter<'_> {
-    type Item = (usize, usize);
+    type Item = (NodeId, NodeId);
 
     #[inline]
-    fn next(&mut self) -> Option<(usize, usize)> {
+    fn next(&mut self) -> Option<(NodeId, NodeId)> {
         match &mut self.inner {
-            IterInner::Packed(it) => it.next().map(|&k| unpack_key(self.codec, k as u128)),
-            IterInner::Wide(it) => it.next().map(|&k| unpack_key(self.codec, k)),
+            IterInner::Memory(it) => it.next().copied().map(unpack_arc),
             IterInner::Merge(m) => m.next_arc(),
         }
     }
@@ -1038,46 +967,40 @@ impl Iterator for SortedArcIter<'_> {
 struct RunReader {
     reader: BufReader<File>,
     path: PathBuf,
-    record_size: usize,
     remaining: u64,
 }
 
 impl RunReader {
-    fn open(path: &Path, codec: ArcCodec) -> PgResult<Self> {
-        let record_size = codec.record_size();
+    fn open(path: &Path) -> Result<Self> {
         let len = std::fs::metadata(path)
-            .map_err(|e| PgError::io(path, e))?
+            .map_err(|e| Error::io(path, e))?
             .len();
-        if len % record_size as u64 != 0 {
-            return Err(PgError::TruncatedRun {
+        if len % ARC_RECORD_SIZE as u64 != 0 {
+            return Err(Error::TruncatedRun {
                 path: path.to_path_buf(),
                 len,
-                record_size,
+                record_size: ARC_RECORD_SIZE,
             });
         }
-        let file = File::open(path).map_err(|e| PgError::io(path, e))?;
+        let file = File::open(path).map_err(|e| Error::io(path, e))?;
         Ok(RunReader {
             reader: BufReader::with_capacity(IO_BUF, file),
             path: path.to_path_buf(),
-            record_size,
-            remaining: len / record_size as u64,
+            remaining: len / ARC_RECORD_SIZE as u64,
         })
     }
 
-    /// Reads the next record, widened to a `u128` merge key.
-    fn next_key(&mut self) -> PgResult<Option<u128>> {
+    /// Reads the next packed arc. One record width, so no dispatch.
+    fn next_key(&mut self) -> Result<Option<u128>> {
         if self.remaining == 0 {
             return Ok(None);
         }
-        let mut raw = [0u8; 16];
+        let mut raw = [0u8; ARC_RECORD_SIZE];
         self.reader
-            .read_exact(&mut raw[..self.record_size])
-            .map_err(|e| PgError::io(&self.path, e))?;
+            .read_exact(&mut raw)
+            .map_err(|e| Error::io(&self.path, e))?;
         self.remaining -= 1;
-        Ok(Some(match self.record_size {
-            8 => u64::from_le_bytes(raw[..8].try_into().expect("8 bytes")) as u128,
-            _ => u128::from_le_bytes(raw),
-        }))
+        Ok(Some(u128::from_le_bytes(raw)))
     }
 }
 
@@ -1085,21 +1008,24 @@ impl RunReader {
 ///
 /// Every run was deduplicated before it was spilled, so only duplicates that
 /// straddle a run boundary remain to be suppressed here.
+///
+/// The trailing `usize` in the heap key is a **run index**, not a node id: the
+/// heap orders packed arcs and remembers which reader each one came from, so
+/// that reader can be advanced.
 struct Merger {
     readers: Vec<RunReader>,
     heap: BinaryHeap<Reverse<(u128, usize)>>,
     last: Option<u128>,
     dedup: bool,
-    codec: ArcCodec,
     slot: ErrorSlot,
     done: bool,
 }
 
 impl Merger {
-    fn open(paths: &[PathBuf], codec: ArcCodec, dedup: bool, slot: ErrorSlot) -> PgResult<Self> {
+    fn open(paths: &[PathBuf], dedup: bool, slot: ErrorSlot) -> Result<Self> {
         let mut readers = Vec::with_capacity(paths.len());
         for p in paths {
-            readers.push(RunReader::open(p, codec)?);
+            readers.push(RunReader::open(p)?);
         }
         let mut heap = BinaryHeap::with_capacity(readers.len());
         for (i, r) in readers.iter_mut().enumerate() {
@@ -1112,14 +1038,13 @@ impl Merger {
             heap,
             last: None,
             dedup,
-            codec,
             slot,
             done: false,
         })
     }
 
     /// Records an error in the side-channel and ends iteration.
-    fn fail(&mut self, e: PgError) -> Option<(usize, usize)> {
+    fn fail(&mut self, e: Error) -> Option<(NodeId, NodeId)> {
         self.done = true;
         if let Ok(mut g) = self.slot.lock() {
             if g.is_none() {
@@ -1129,7 +1054,7 @@ impl Merger {
         None
     }
 
-    fn next_arc(&mut self) -> Option<(usize, usize)> {
+    fn next_arc(&mut self) -> Option<(NodeId, NodeId)> {
         if self.done {
             return None;
         }
@@ -1148,7 +1073,7 @@ impl Merger {
                 continue;
             }
             self.last = Some(key);
-            return Some(unpack_key(self.codec, key));
+            return Some(unpack_arc(key));
         }
     }
 }
@@ -1159,14 +1084,9 @@ impl Merger {
 /// No `expected_updates`: the distinct count is precisely the unknown this
 /// pass exists to compute, so the logger reports a rate and a running total
 /// rather than a percentage.
-fn count_merged(
-    paths: &[PathBuf],
-    codec: ArcCodec,
-    dedup: bool,
-    pl: &mut impl ProgressLog,
-) -> PgResult<u64> {
+fn count_merged(paths: &[PathBuf], dedup: bool, pl: &mut impl ProgressLog) -> Result<u64> {
     let slot = new_error_slot();
-    let mut merger = Merger::open(paths, codec, dedup, slot.clone())?;
+    let mut merger = Merger::open(paths, dedup, slot.clone())?;
     let mut n = 0u64;
     pl.item_name("arc");
     pl.start(format!(
@@ -1182,7 +1102,7 @@ fn count_merged(
     Ok(n)
 }
 
-/// Removes `pgraph-sort-<pid>-*` spill directories left by processes that are
+/// Removes `utxo2webgraph-sort-<pid>-*` spill directories left by processes that are
 /// no longer alive.
 ///
 /// A run killed by `SIGINT` or `SIGKILL` never runs `TempDir`'s destructor: a
@@ -1190,7 +1110,7 @@ fn count_merged(
 /// 549. Nothing ever removed them, so they accumulated and made the next run's
 /// free-space preflight wrong. This is called once at startup, before the
 /// space checks. Directories belonging to a live process — a concurrent
-/// `pgraph` — are never touched.
+/// `utxo2webgraph` — are never touched.
 ///
 /// Returns the number of directories removed. Errors are logged, never fatal:
 /// reaping is hygiene, not correctness.
@@ -1204,10 +1124,10 @@ pub fn reap_stale_run_dirs(tmp_dir: &Path) -> usize {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        let Some(rest) = name.strip_prefix("pgraph-sort-") else {
+        let Some(rest) = name.strip_prefix("utxo2webgraph-sort-") else {
             continue;
         };
-        // `pgraph-sort-<pid>-<random>`; anything else predates this naming.
+        // `utxo2webgraph-sort-<pid>-<random>`; anything else predates this naming.
         let Some((pid, _)) = rest.split_once('-') else {
             continue;
         };
@@ -1252,83 +1172,92 @@ fn process_is_alive(pid: u32) -> bool {
 /// How an arc file on disk is encoded.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ArcFileFormat {
-    /// `{src}\t{dst}\n` text, as produced by `TsvArcSink` and by Java's
-    /// `PaymentGraphEdgeListBuilder`.
+    /// `{src}\t{dst}\n` text, as produced by [`TsvArcSink`] and by the
+    /// historical edge-list builder this crate replaces.
     Tsv,
-    /// Fixed-width little-endian records.
-    Binary(ArcCodec),
+    /// Fixed-width little-endian [`ARC_RECORD_SIZE`]-byte records, as produced
+    /// by [`BinaryArcSink`].
+    Binary,
 }
 
 /// Sniffs *text versus binary*, and nothing else.
 ///
 /// Reads the first 4 KiB. If every byte is an ASCII digit, a TAB or an LF the
-/// file is reported as [`ArcFileFormat::Tsv`]; otherwise it is binary in
-/// `codec`, whose record width the caller supplies.
+/// file is reported as [`ArcFileFormat::Tsv`]; otherwise it is
+/// [`ArcFileFormat::Binary`], whose record width is [`ARC_RECORD_SIZE`] and
+/// can be nothing else.
 ///
-/// # Why the width is a parameter and not a guess
+/// # Why there is exactly one binary width
 ///
 /// A fixed-width binary file's record width is **not** inferable from its
-/// length. The previous version tried (`len % 8 == 0` -> `Packed32`, else
-/// `len % 16 == 0` -> `Wide`), but every multiple of 16 is also a multiple of
-/// 8, so the `Wide` arm was unreachable and a 128-bit arc file was silently
-/// decoded as twice as many bogus 64-bit arcs: a file holding the single wide
-/// arc `(0, 2)` came back as the two arcs `0 -> 0` and `0 -> 2`, with no
-/// warning and exit 0. There is no header to disambiguate, so the caller's
-/// `--arc-codec` decides, and a length that is not a whole number of records
-/// is an error.
+/// length, and this format carries no header to state it. An earlier version
+/// supported two widths and tried to guess between them (`len % 8 == 0` -> the
+/// 8-byte record, else `len % 16 == 0` -> the 16-byte one), but every multiple
+/// of 16 is also a multiple of 8, so the 16-byte arm was unreachable: a file
+/// holding the single 16-byte arc `(0, 2)` came back as the two bogus arcs
+/// `0 -> 0` and `0 -> 2`, with no warning and exit 0. Taking the width from the
+/// caller instead only moved the failure — one mis-set flag decoded the same
+/// file the same wrong way, just as quietly.
+///
+/// Fixing the width at 16 bytes retires the question. Every writer and every
+/// reader in this crate agrees on [`ARC_RECORD_SIZE`]; there is nothing to
+/// guess, nothing to configure and nothing to get wrong, and a length that is
+/// not a whole number of records is an error instead of a silent
+/// reinterpretation.
 ///
 /// **A zero-length file is reported as [`ArcFileFormat::Tsv`]**; the caller is
-/// responsible for turning that into [`PgError::EmptyEdgeList`] rather than
-/// letting it cascade. The Java pipeline did not: `logs/webgraph_builder.err`
-/// records `IllegalArgumentException: Expected integer, found Token[EOF],
-/// line 1`, thrown two stages downstream of the real problem.
-pub fn detect_format(path: &Path, codec: ArcCodec) -> PgResult<ArcFileFormat> {
+/// responsible for turning that into [`Error::EmptyEdgeList`] rather than
+/// letting it cascade, because an empty arc stream surfaces downstream as a
+/// parse failure on line 1 — two stages away from the real problem, and
+/// unrecognisable as "the edge list is empty".
+pub fn detect_format(path: &Path) -> Result<ArcFileFormat> {
     let len = std::fs::metadata(path)
-        .map_err(|e| PgError::io(path, e))?
+        .map_err(|e| Error::io(path, e))?
         .len();
     if len == 0 {
         return Ok(ArcFileFormat::Tsv);
     }
-    let mut file = File::open(path).map_err(|e| PgError::io(path, e))?;
+    let mut file = File::open(path).map_err(|e| Error::io(path, e))?;
     let mut head = vec![0u8; 4096.min(len as usize)];
     file.read_exact(&mut head)
-        .map_err(|e| PgError::io(path, e))?;
+        .map_err(|e| Error::io(path, e))?;
     let textual = head
         .iter()
         .all(|&b| b.is_ascii_digit() || b == b'\t' || b == b'\n');
     if textual {
         return Ok(ArcFileFormat::Tsv);
     }
-    let record = codec.record_size() as u64;
+    let record = ARC_RECORD_SIZE as u64;
     if len % record != 0 {
-        return Err(PgError::other(format!(
+        return Err(Error::other(format!(
             "{}: not a TSV edge list, and its length {} is not a multiple of the {} bytes \
-             per {:?} arc; pass --arc-codec for the width it was written with",
+             per binary arc record; it is truncated, or it was not written by this pipeline",
             path.display(),
             len,
-            record,
-            codec
+            record
         )));
     }
-    Ok(ArcFileFormat::Binary(codec))
+    Ok(ArcFileFormat::Binary)
 }
 
 /// Reads a text edge list, yielding `(src, dst)`.
 ///
-/// # Deliberately stricter than Java
+/// # Deliberately strict
 ///
-/// Java's `ArcListASCIIGraph` used a `StreamTokenizer`, which treats every byte
-/// in `0x00..=0x20` as a separator and *discards one token per record* — so
-/// `0\t1\t9` parsed as the arc `0 -> 1` with the `9` silently eaten, and a
-/// malformed three-column edge list produced a wrong graph with no error at
-/// all. This parser requires exactly two TAB-separated decimal fields.
+/// The tempting implementation treats every byte in `0x00..=0x20` as a
+/// separator and takes the first two tokens of each record. That accepts a
+/// malformed three-column edge list without a murmur: `0\t1\t9` parses as the
+/// arc `0 -> 1` with the `9` silently eaten, and the run produces a wrong graph
+/// with no error at all. This parser instead requires exactly two TAB-separated
+/// decimal fields, so a third column is a line-numbered failure.
 ///
-/// Blank lines are skipped, matching Java's tolerance of them. A malformed line
-/// stores [`PgError::BadArcLine`] naming the file, the 1-based line number and
+/// Blank lines are skipped, which is the one tolerance worth keeping: a
+/// trailing newline at end of file must not be an error. A malformed line
+/// stores [`Error::BadArcLine`] naming the file, the 1-based line number and
 /// the offending text into the returned [`ErrorSlot`] and ends iteration;
 /// callers must check the slot with [`crate::take_iter_error`].
-pub fn read_tsv_arcs(path: &Path) -> PgResult<(TsvArcIter, ErrorSlot)> {
-    let file = File::open(path).map_err(|e| PgError::io(path, e))?;
+pub fn read_tsv_arcs(path: &Path) -> Result<(TsvArcIter, ErrorSlot)> {
+    let file = File::open(path).map_err(|e| Error::io(path, e))?;
     let slot = new_error_slot();
     Ok((
         TsvArcIter {
@@ -1354,7 +1283,7 @@ pub struct TsvArcIter {
 }
 
 impl TsvArcIter {
-    fn fail(&mut self, e: PgError) -> Option<(usize, usize)> {
+    fn fail(&mut self, e: Error) -> Option<(NodeId, NodeId)> {
         self.done = true;
         if let Ok(mut g) = self.slot.lock() {
             if g.is_none() {
@@ -1369,17 +1298,17 @@ impl TsvArcIter {
 /// non-digit byte; leading zeros are accepted and normalised away, so a legacy
 /// `007\t5` produced by some other tool becomes the arc `7 -> 5` rather than a
 /// second, textually distinct copy of it.
-fn parse_field(s: &str) -> Option<usize> {
+fn parse_field(s: &str) -> Option<NodeId> {
     if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    s.parse::<u64>().ok().and_then(|v| usize::try_from(v).ok())
+    s.parse::<u64>().ok().and_then(|v| NodeId::try_from(v).ok())
 }
 
 impl Iterator for TsvArcIter {
-    type Item = (usize, usize);
+    type Item = (NodeId, NodeId);
 
-    fn next(&mut self) -> Option<(usize, usize)> {
+    fn next(&mut self) -> Option<(NodeId, NodeId)> {
         if self.done {
             return None;
         }
@@ -1397,7 +1326,7 @@ impl Iterator for TsvArcIter {
                 Ok(_) => {}
                 Err(e) => {
                     let path = self.path.clone();
-                    return self.fail(PgError::io(path, e));
+                    return self.fail(Error::io(path, e));
                 }
             }
             self.line += 1;
@@ -1411,7 +1340,7 @@ impl Iterator for TsvArcIter {
             match parsed {
                 Some(arc) => return Some(arc),
                 None => {
-                    let e = PgError::BadArcLine {
+                    let e = Error::BadArcLine {
                         path: self.path.clone(),
                         line: self.line,
                         text: text.to_string(),
@@ -1426,27 +1355,26 @@ impl Iterator for TsvArcIter {
 /// Reads fixed-width little-endian arc records.
 ///
 /// The file length is validated up front: a length that is not a multiple of
-/// the record size means a torn write and yields [`PgError::TruncatedRun`]
+/// [`ARC_RECORD_SIZE`] means a torn write and yields [`Error::TruncatedRun`]
 /// immediately, before any arc is produced.
-pub fn read_binary_arcs(path: &Path, codec: ArcCodec) -> PgResult<(BinaryArcIter, ErrorSlot)> {
-    let record_size = codec.record_size();
+pub fn read_binary_arcs(path: &Path) -> Result<(BinaryArcIter, ErrorSlot)> {
+    let record_size = ARC_RECORD_SIZE;
     let len = std::fs::metadata(path)
-        .map_err(|e| PgError::io(path, e))?
+        .map_err(|e| Error::io(path, e))?
         .len();
     if len % record_size as u64 != 0 {
-        return Err(PgError::TruncatedRun {
+        return Err(Error::TruncatedRun {
             path: path.to_path_buf(),
             len,
             record_size,
         });
     }
-    let file = File::open(path).map_err(|e| PgError::io(path, e))?;
+    let file = File::open(path).map_err(|e| Error::io(path, e))?;
     let slot = new_error_slot();
     Ok((
         BinaryArcIter {
             reader: BufReader::with_capacity(IO_BUF, file),
             path: path.to_path_buf(),
-            codec,
             remaining: len / record_size as u64,
             slot: slot.clone(),
             done: false,
@@ -1460,41 +1388,35 @@ pub fn read_binary_arcs(path: &Path, codec: ArcCodec) -> PgResult<(BinaryArcIter
 pub struct BinaryArcIter {
     reader: BufReader<File>,
     path: PathBuf,
-    codec: ArcCodec,
     remaining: u64,
     slot: ErrorSlot,
     done: bool,
 }
 
 impl Iterator for BinaryArcIter {
-    type Item = (usize, usize);
+    type Item = (NodeId, NodeId);
 
-    fn next(&mut self) -> Option<(usize, usize)> {
+    fn next(&mut self) -> Option<(NodeId, NodeId)> {
         if self.done || self.remaining == 0 {
             return None;
         }
-        let rs = self.codec.record_size();
-        let mut raw = [0u8; 16];
-        if let Err(e) = self.reader.read_exact(&mut raw[..rs]) {
+        let mut raw = [0u8; ARC_RECORD_SIZE];
+        if let Err(e) = self.reader.read_exact(&mut raw) {
             self.done = true;
             if let Ok(mut g) = self.slot.lock() {
                 if g.is_none() {
-                    *g = Some(PgError::io(self.path.clone(), e));
+                    *g = Some(Error::io(self.path.clone(), e));
                 }
             }
             return None;
         }
         self.remaining -= 1;
-        let key = match rs {
-            8 => u64::from_le_bytes(raw[..8].try_into().expect("8 bytes")) as u128,
-            _ => u128::from_le_bytes(raw),
-        };
-        Some(unpack_key(self.codec, key))
+        Some(unpack_arc(u128::from_le_bytes(raw)))
     }
 }
 
 /// Sorts an existing arc file, sniffing its format. This is the backend of
-/// `pgraph sort-edges`.
+/// `utxo2webgraph sort-edges`.
 ///
 /// `pl` covers the read pass and is then forwarded to
 /// [`ArcSorter::into_sorted`], whose counting merge reuses it. No
@@ -1508,14 +1430,9 @@ pub fn sort_file(
     input: &Path,
     opts: SortOpts,
     pl: &mut impl ProgressLog,
-) -> PgResult<(SortedArcs, SortStats)> {
-    let format = detect_format(input, opts.codec)?;
-    info!(
-        "sorting {} (detected {:?}) with codec {:?}",
-        input.display(),
-        format,
-        opts.codec
-    );
+) -> Result<(SortedArcs, SortStats)> {
+    let format = detect_format(input)?;
+    info!("sorting {} (detected {:?})", input.display(), format);
     let mut sorter = ArcSorter::new(opts)?;
     pl.item_name("arc");
     pl.start(format!("Reading the arcs of {}...", input.display()));
@@ -1523,15 +1440,15 @@ pub fn sort_file(
         ArcFileFormat::Tsv => {
             let (iter, slot) = read_tsv_arcs(input)?;
             for (src, dst) in iter {
-                sorter.push(src as NodeId, dst as NodeId)?;
+                sorter.push(src, dst)?;
                 pl.light_update();
             }
             take_iter_error(&slot)?;
         }
-        ArcFileFormat::Binary(codec) => {
-            let (iter, slot) = read_binary_arcs(input, codec)?;
+        ArcFileFormat::Binary => {
+            let (iter, slot) = read_binary_arcs(input)?;
             for (src, dst) in iter {
-                sorter.push(src as NodeId, dst as NodeId)?;
+                sorter.push(src, dst)?;
                 pl.light_update();
             }
             take_iter_error(&slot)?;
@@ -1549,7 +1466,6 @@ pub fn sort_file(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{unpack_arc, ARC_ID_LIMIT};
 
     /// A fixed linear congruential generator, so the tests need no `rand`
     /// dependency and are bit-for-bit reproducible.
@@ -1567,15 +1483,21 @@ mod tests {
 
     fn tmpdir() -> tempfile::TempDir {
         tempfile::Builder::new()
-            .prefix("pgraph-arcs-test-")
+            .prefix("utxo2webgraph-arcs-test-")
             .tempdir()
             .expect("temp dir")
     }
 
+    /// The node id one past the ceiling the old `(src << 32) | dst` packing
+    /// imposed. Nothing special happens here any more; several tests use it
+    /// precisely to show that.
+    const OLD_CEILING: NodeId = 1 << 32;
+
     /// `fsync(2)` on a character device returns EINVAL. A completed run used
     /// to be reported as `Error: I/O error on /dev/null: Invalid argument
-    /// (os error 22)`, exit 1 — Java's `PrintWriter` never synced and handled
-    /// `/dev/null`, fifos and process substitution fine.
+    /// (os error 22)` and exit 1, which put `/dev/null`, fifos and process
+    /// substitution out of reach as destinations even though nothing had
+    /// actually failed.
     #[test]
     fn a_non_regular_destination_is_written_without_failing_on_fsync() {
         let dev_null = Path::new("/dev/null");
@@ -1589,7 +1511,7 @@ mod tests {
             .expect("a completed write to /dev/null is a success");
         assert_eq!(sink.count(), 2);
 
-        let mut sink = BinaryArcSink::create(dev_null, ArcCodec::Packed32).expect("create");
+        let mut sink = BinaryArcSink::create(dev_null).expect("create");
         sink.push(1, 2).expect("push");
         sink.finish().expect("same for the binary sink");
     }
@@ -1603,7 +1525,7 @@ mod tests {
         let path = dir.path().join("arcs.tsv");
         {
             let mut sink = TsvArcSink::create(&path).expect("create");
-            for i in 0..10_000u64 {
+            for i in 0..10_000 as NodeId {
                 sink.push(i, i + 1).expect("push");
             }
             // No `finish()`: the run "failed" here.
@@ -1623,15 +1545,15 @@ mod tests {
     fn stale_spill_directories_are_reaped_and_live_ones_are_not() {
         let dir = tmpdir();
         // Pid 0 is never a live process on Linux.
-        let dead = dir.path().join("pgraph-sort-0-abcdef");
+        let dead = dir.path().join("utxo2webgraph-sort-0-abcdef");
         let mine = dir
             .path()
-            .join(format!("pgraph-sort-{}-abcdef", std::process::id()));
+            .join(format!("utxo2webgraph-sort-{}-abcdef", std::process::id()));
         let other = dir.path().join("something-else");
         for d in [&dead, &mine, &other] {
             std::fs::create_dir_all(d).expect("mkdir");
         }
-        std::fs::write(dead.join("run-00000.arcs"), [0u8; 8]).expect("write");
+        std::fs::write(dead.join("run-00000.arcs"), [0u8; ARC_RECORD_SIZE]).expect("write");
 
         let removed = reap_stale_run_dirs(dir.path());
         if cfg!(target_os = "linux") {
@@ -1642,20 +1564,31 @@ mod tests {
         assert!(other.exists(), "unrelated directories are never touched");
     }
 
+    /// The packing has no ceiling. That is the entire point of spending
+    /// sixteen bytes on an arc, so it is what this test pins.
+    ///
+    /// It used to assert the opposite: that `pack_arc` returned `None` at and
+    /// above `2^32`. The first three pairs below are the ones that ceiling
+    /// rejected outright.
     #[test]
-    fn pack_arc_round_trips() {
+    fn pack_arc_round_trips_with_no_ceiling() {
         for &(s, d) in &[
-            (0u64, 0u64),
+            (OLD_CEILING, 0 as NodeId),
+            (0, OLD_CEILING),
+            (OLD_CEILING + 7, OLD_CEILING + 7),
+            (0, 0),
             (1, 2),
             (9, 171),
             (778_613_437, 914),
-            (ARC_ID_LIMIT - 1, ARC_ID_LIMIT - 1),
+            (OLD_CEILING - 1, OLD_CEILING - 1),
+            (NodeId::MAX, NodeId::MAX),
         ] {
-            let k = pack_arc(s, d).expect("representable");
-            assert_eq!(unpack_arc(k), (s, d));
+            assert_eq!(unpack_arc(pack_arc(s, d)), (s, d));
         }
-        assert!(pack_arc(ARC_ID_LIMIT, 0).is_none());
-        assert!(pack_arc(0, ARC_ID_LIMIT).is_none());
+        // The halves never bleed into each other, which is what lets a plain
+        // ascending sort of the packed values order by source then destination.
+        assert_eq!(unpack_arc(pack_arc(1, NodeId::MAX)), (1, NodeId::MAX));
+        assert_eq!(ARC_RECORD_SIZE, std::mem::size_of::<u128>());
     }
 
     #[test]
@@ -1663,7 +1596,7 @@ mod tests {
         let dir = tmpdir();
         let path = dir.path().join("el.tsv");
         let mut sink = TsvArcSink::create(&path).expect("create");
-        for &(s, d) in &[(9u64, 171u64), (9, 172), (172, 184)] {
+        for &(s, d) in &[(9 as NodeId, 171 as NodeId), (9, 172), (172, 184)] {
             sink.push(s, d).expect("push");
         }
         sink.finish().expect("finish");
@@ -1674,11 +1607,17 @@ mod tests {
 
     /// 50 000 shuffled arcs with heavy duplication, a memory budget small
     /// enough to force several spill runs, compared against a naive sort.
-    fn heavy_duplication_input() -> Vec<(u64, u64)> {
+    fn heavy_duplication_input() -> Vec<(NodeId, NodeId)> {
         let mut lcg = Lcg(0x5EED_1234);
         (0..50_000)
-            .map(|_| (lcg.next() % 400, lcg.next() % 400))
+            .map(|_| ((lcg.next() % 400) as NodeId, (lcg.next() % 400) as NodeId))
             .collect()
+    }
+
+    /// A budget of `arcs * 2 * ARC_RECORD_SIZE` buffers exactly `arcs` arcs:
+    /// the factor two is the radix sort's scratch buffer.
+    fn budget_for(arcs: u64) -> u64 {
+        arcs * 2 * ARC_RECORD_SIZE as u64
     }
 
     #[test]
@@ -1687,7 +1626,7 @@ mod tests {
         let input = heavy_duplication_input();
 
         let opts = SortOpts {
-            memory_bytes: 12_000 * 2 * 8, // 12 000 arcs per run => 5 runs
+            memory_bytes: budget_for(12_000), // 12 000 arcs per run => 5 runs
             tmp_dir: dir.path().to_path_buf(),
             ..SortOpts::default()
         };
@@ -1700,13 +1639,13 @@ mod tests {
         let (sorted, stats) = sorter.into_sorted(no_logging!()).expect("into_sorted");
         assert!(stats.runs >= 3, "expected several runs, got {}", stats.runs);
 
-        let mut expected: Vec<(u64, u64)> = input.clone();
+        let mut expected: Vec<(NodeId, NodeId)> = input.clone();
         expected.sort_unstable();
         let raw = expected.len() as u64;
         expected.dedup();
 
         let (iter, slot) = sorted.iter().expect("iter");
-        let got: Vec<(u64, u64)> = iter.map(|(s, d)| (s as u64, d as u64)).collect();
+        let got: Vec<(NodeId, NodeId)> = iter.collect();
         take_iter_error(&slot).expect("no merge error");
 
         assert_eq!(got, expected);
@@ -1727,7 +1666,7 @@ mod tests {
 
         let opts = SortOpts {
             dedup: false,
-            memory_bytes: 12_000 * 2 * 8,
+            memory_bytes: budget_for(12_000),
             tmp_dir: dir.path().to_path_buf(),
             ..SortOpts::default()
         };
@@ -1738,11 +1677,11 @@ mod tests {
         sorter.finish().expect("finish");
         let (sorted, stats) = sorter.into_sorted(no_logging!()).expect("into_sorted");
 
-        let mut expected: Vec<(u64, u64)> = input.clone();
+        let mut expected: Vec<(NodeId, NodeId)> = input.clone();
         expected.sort_unstable();
 
         let (iter, slot) = sorted.iter().expect("iter");
-        let got: Vec<(u64, u64)> = iter.map(|(s, d)| (s as u64, d as u64)).collect();
+        let got: Vec<(NodeId, NodeId)> = iter.collect();
         take_iter_error(&slot).expect("no merge error");
 
         assert_eq!(got, expected);
@@ -1751,11 +1690,18 @@ mod tests {
         assert!(got.windows(2).all(|w| w[0] <= w[1]));
     }
 
+    /// Node ids far above `2^32` are ordinary ids, and asking for the radix
+    /// backend gets the radix backend.
+    ///
+    /// This test used to assert the opposite — that a 128-bit arc forced a
+    /// silent downgrade to [`SortAlgo::Pdq`]. `rdst` implements `RadixKey` for
+    /// `u128`, so there is nothing left to downgrade, and the assertion is
+    /// inverted rather than dropped: a backend quietly substituted for the one
+    /// that was asked for is exactly what this pins against.
     #[test]
-    fn wide_codec_handles_ids_above_2_32_and_downgrades_radix() {
+    fn ids_above_2_32_sort_and_radix_is_not_downgraded() {
         let dir = tmpdir();
         let opts = SortOpts {
-            codec: ArcCodec::Wide,
             algo: SortAlgo::Radix,
             tmp_dir: dir.path().to_path_buf(),
             ..SortOpts::default()
@@ -1763,12 +1709,12 @@ mod tests {
         let mut sorter = ArcSorter::new(opts).expect("sorter");
         assert_eq!(
             sorter.effective_algo(),
-            SortAlgo::Pdq,
-            "the wide codec must downgrade radix to pdq"
+            SortAlgo::Radix,
+            "radix must survive: a packed arc is a u128 and rdst sorts those"
         );
 
-        let big = ARC_ID_LIMIT + 7;
-        let arcs = [(big, 5u64), (1u64, big), (big, big), (0, 1)];
+        let big = OLD_CEILING + 7;
+        let arcs = [(big, 5), (1, big), (big, big), (0, 1)];
         for &(s, d) in &arcs {
             sorter.push(s, d).expect("push");
         }
@@ -1777,26 +1723,51 @@ mod tests {
         assert_eq!(stats.max_node_id, big);
 
         let (iter, slot) = sorted.iter().expect("iter");
-        let got: Vec<(u64, u64)> = iter.map(|(s, d)| (s as u64, d as u64)).collect();
+        let got: Vec<(NodeId, NodeId)> = iter.collect();
         take_iter_error(&slot).expect("no error");
         let mut expected = arcs.to_vec();
         expected.sort_unstable();
         assert_eq!(got, expected);
     }
 
+    /// There is no id the sorter refuses.
+    ///
+    /// The predecessor of this test asserted that pushing `2^32` failed with
+    /// an overflow error. Both the limit and the error are gone, so the test
+    /// now pins their absence — all the way up to `NodeId::MAX`, which is the
+    /// widest id that exists.
     #[test]
-    fn packed_codec_rejects_ids_at_the_limit() {
+    fn the_sorter_accepts_ids_the_old_ceiling_rejected() {
         let dir = tmpdir();
         let opts = SortOpts {
             tmp_dir: dir.path().to_path_buf(),
             ..SortOpts::default()
         };
         let mut sorter = ArcSorter::new(opts).expect("sorter");
-        let err = sorter.push(ARC_ID_LIMIT, 0).expect_err("must overflow");
-        match err {
-            PgError::ArcCodecOverflow(id) => assert_eq!(id, ARC_ID_LIMIT),
-            other => panic!("expected ArcCodecOverflow, got {other:?}"),
+        for &(s, d) in &[
+            (OLD_CEILING, 0 as NodeId),
+            (0, OLD_CEILING),
+            (NodeId::MAX, NodeId::MAX),
+        ] {
+            sorter.push(s, d).expect("no id is out of range any more");
         }
+        sorter.finish().expect("finish");
+        let (sorted, stats) = sorter.into_sorted(no_logging!()).expect("into_sorted");
+        assert_eq!(stats.max_node_id, NodeId::MAX);
+        assert_eq!(sorted.num_arcs(), 3);
+        assert_eq!(sorted.max_node_id(), NodeId::MAX);
+
+        let (iter, slot) = sorted.iter().expect("iter");
+        let got: Vec<(NodeId, NodeId)> = iter.collect();
+        take_iter_error(&slot).expect("no error");
+        assert_eq!(
+            got,
+            vec![
+                (0, OLD_CEILING),
+                (OLD_CEILING, 0),
+                (NodeId::MAX, NodeId::MAX)
+            ]
+        );
     }
 
     #[test]
@@ -1805,57 +1776,45 @@ mod tests {
 
         let tsv = dir.path().join("a.tsv");
         std::fs::write(&tsv, b"0\t1\n2\t3\n").expect("write");
-        assert_eq!(
-            detect_format(&tsv, ArcCodec::Packed32).expect("detect"),
-            ArcFileFormat::Tsv
-        );
+        assert_eq!(detect_format(&tsv).expect("detect"), ArcFileFormat::Tsv);
 
         let bin = dir.path().join("a.bin");
-        std::fs::write(&bin, 1u64.to_le_bytes()).expect("write");
-        assert_eq!(
-            detect_format(&bin, ArcCodec::Packed32).expect("detect"),
-            ArcFileFormat::Binary(ArcCodec::Packed32)
-        );
+        std::fs::write(&bin, pack_arc(1, 2).to_le_bytes()).expect("write");
+        assert_eq!(detect_format(&bin).expect("detect"), ArcFileFormat::Binary);
 
+        // 13 bytes is not a whole number of 16-byte records.
         let odd = dir.path().join("a.odd");
         std::fs::write(&odd, [0xFFu8; 13]).expect("write");
-        assert!(detect_format(&odd, ArcCodec::Packed32).is_err());
+        assert!(detect_format(&odd).is_err());
 
         let empty = dir.path().join("a.empty");
         std::fs::write(&empty, b"").expect("write");
-        assert_eq!(
-            detect_format(&empty, ArcCodec::Packed32).expect("detect"),
-            ArcFileFormat::Tsv
-        );
+        assert_eq!(detect_format(&empty).expect("detect"), ArcFileFormat::Tsv);
     }
 
-    /// A 128-bit arc file is 16 bytes per record, which is also a multiple of
-    /// 8: the width can only come from the caller.
+    /// A binary arc file has exactly one reading, because there is exactly one
+    /// record width.
     ///
-    /// Before this, `--arc-codec wide` was ignored and the single wide arc
-    /// `(0, 2)` was decoded as the TWO packed arcs `(0, 0)` and `(0, 2)`, with
-    /// no warning and exit 0.
+    /// When two widths existed, a 16-byte arc file was also a multiple of 8, so
+    /// the single arc `(0, 2)` decoded as the two bogus arcs `(0, 0)` and
+    /// `(0, 2)` — no warning, exit 0. Nothing in the file distinguishes the two
+    /// readings; only a fixed [`ARC_RECORD_SIZE`] does, and this pins it.
     #[test]
-    fn a_wide_arc_file_is_not_mistaken_for_two_packed_arcs() {
+    fn a_binary_arc_file_has_exactly_one_reading() {
         let dir = tmpdir();
-        let path = dir.path().join("wide.bin");
-        std::fs::write(&path, wide_arc(0, 2).to_le_bytes()).expect("write");
-
+        let path = dir.path().join("arcs.bin");
+        std::fs::write(&path, pack_arc(0, 2).to_le_bytes()).expect("write");
         assert_eq!(
-            detect_format(&path, ArcCodec::Wide).expect("detect"),
-            ArcFileFormat::Binary(ArcCodec::Wide)
+            std::fs::metadata(&path).expect("stat").len(),
+            ARC_RECORD_SIZE as u64,
+            "one arc is one record"
         );
-        let (iter, slot) = read_binary_arcs(&path, ArcCodec::Wide).expect("open");
+
+        assert_eq!(detect_format(&path).expect("detect"), ArcFileFormat::Binary);
+        let (iter, slot) = read_binary_arcs(&path).expect("open");
         let arcs: Vec<_> = iter.collect();
         take_iter_error(&slot).expect("no error");
-        assert_eq!(arcs, vec![(0, 2)]);
-
-        // And the same file, read with the wrong width, is still two arcs —
-        // which is why the width is never guessed.
-        assert_eq!(
-            detect_format(&path, ArcCodec::Packed32).expect("detect"),
-            ArcFileFormat::Binary(ArcCodec::Packed32)
-        );
+        assert_eq!(arcs, vec![(0, 2)], "one arc in, one arc out");
     }
 
     #[test]
@@ -1867,7 +1826,7 @@ mod tests {
         let got: Vec<_> = iter.collect();
         assert_eq!(got, vec![(0, 1), (2, 3)]);
         match take_iter_error(&slot) {
-            Err(PgError::BadArcLine { line, text, .. }) => {
+            Err(Error::BadArcLine { line, text, .. }) => {
                 assert_eq!(line, 3);
                 assert_eq!(text, "not an arc");
             }
@@ -1879,13 +1838,13 @@ mod tests {
     fn run_file_round_trips_and_detects_truncation() {
         let dir = tmpdir();
         let opts = SortOpts {
-            memory_bytes: 1024 * 2 * 8,
+            memory_bytes: budget_for(1024),
             tmp_dir: dir.path().to_path_buf(),
             keep_intermediate: true,
             ..SortOpts::default()
         };
         let mut sorter = ArcSorter::new(opts).expect("sorter");
-        for i in 0..1024u64 {
+        for i in 0..1024 as NodeId {
             sorter.push(i % 17, i).expect("push");
         }
         // The 1024th push fills the buffer and spills exactly one run.
@@ -1896,27 +1855,27 @@ mod tests {
         let run = dir.path().join("run-00000.arcs");
         assert!(run.is_file(), "the run must survive keep_intermediate");
 
-        let (iter, slot) = read_binary_arcs(&run, ArcCodec::Packed32).expect("open run");
-        let from_file: Vec<(usize, usize)> = iter.collect();
+        let (iter, slot) = read_binary_arcs(&run).expect("open run");
+        let from_file: Vec<(NodeId, NodeId)> = iter.collect();
         take_iter_error(&slot).expect("no error");
 
         let (iter, slot) = sorted.iter().expect("iter");
-        let from_merge: Vec<(usize, usize)> = iter.collect();
+        let from_merge: Vec<(NodeId, NodeId)> = iter.collect();
         take_iter_error(&slot).expect("no error");
         assert_eq!(from_file, from_merge);
         assert_eq!(from_file.len(), 1024);
 
-        // Lop off one byte: the length is no longer a multiple of 8.
+        // Lop off one byte: the length is no longer a multiple of 16.
         let truncated = dir.path().join("truncated.arcs");
         let mut bytes = std::fs::read(&run).expect("read run");
         bytes.pop();
         std::fs::write(&truncated, &bytes).expect("write");
-        match read_binary_arcs(&truncated, ArcCodec::Packed32) {
-            Err(PgError::TruncatedRun {
+        match read_binary_arcs(&truncated) {
+            Err(Error::TruncatedRun {
                 len, record_size, ..
             }) => {
                 assert_eq!(len, bytes.len() as u64);
-                assert_eq!(record_size, 8);
+                assert_eq!(record_size, ARC_RECORD_SIZE);
             }
             other => panic!("expected TruncatedRun, got {other:?}"),
         }
@@ -1941,6 +1900,36 @@ mod tests {
             std::fs::read_to_string(&out).expect("read"),
             "0\t9\n1\t2\n5\t4\n"
         );
+    }
+
+    /// The binary arc file this crate writes is the one it reads back.
+    #[test]
+    fn sort_file_round_trips_through_binary() {
+        let dir = tmpdir();
+        let opts = SortOpts {
+            tmp_dir: dir.path().to_path_buf(),
+            ..SortOpts::default()
+        };
+        let mut sorter = ArcSorter::new(opts.clone()).expect("sorter");
+        for &(s, d) in &[(5 as NodeId, 4 as NodeId), (1, 2), (5, 4), (0, OLD_CEILING)] {
+            sorter.push(s, d).expect("push");
+        }
+        sorter.finish().expect("finish");
+        let (sorted, _) = sorter.into_sorted(no_logging!()).expect("into_sorted");
+
+        let bin = dir.path().join("arcs.bin");
+        assert_eq!(
+            sorted.write_binary(&bin, no_logging!()).expect("write"),
+            3,
+            "the duplicate (5, 4) is removed"
+        );
+
+        let (again, stats) = sort_file(&bin, opts, no_logging!()).expect("sort the binary file");
+        assert_eq!(stats.raw_arcs, 3);
+        let (iter, slot) = again.iter().expect("iter");
+        let got: Vec<(NodeId, NodeId)> = iter.collect();
+        take_iter_error(&slot).expect("no error");
+        assert_eq!(got, vec![(0, OLD_CEILING), (1, 2), (5, 4)]);
     }
 
     #[test]

@@ -1,5 +1,4 @@
-//! Chunk splitting and chunked input. Ported from `splitter.sh` and
-//! `builder.sh` by **Matteo Loporchio**.
+//! Chunk splitting and chunked input.
 //!
 //! Two things live here:
 //!
@@ -7,6 +6,21 @@
 //!   that replaces `builder.sh`'s 135 GB temporary file;
 //! * [`split`], the six-month chunker that replaces `splitter.sh`'s awk
 //!   program, including its **Europe/Rome local-midnight** boundaries.
+//!
+//! # Attribution
+//!
+//! The six-month chunking scheme — the interval width, the boundary grid it
+//! lands on and the place it occupies at the head of the pipeline — is part of
+//! the graph-construction design of **Matteo Loporchio**. This module is an
+//! independent reimplementation of it.
+//!
+//! Its shell prototype, `splitter.sh` and `builder.sh`, remains the reference
+//! for behaviour rather than for design: the 132 GB of chunks already on disk
+//! were produced by it, so anything that would place a record in a different
+//! file than it did is a regression, not an improvement. That is why the two
+//! scripts are named below wherever one of their quirks is reproduced on
+//! purpose, and why the two places this module deliberately departs from them
+//! ([`SplitOpts::append`], [`SplitOpts::create_empty`]) each say so.
 //!
 //! # Timezone
 //!
@@ -34,7 +48,7 @@ use chrono::{Datelike, TimeZone, Utc};
 use chrono_tz::Tz;
 use dsi_progress_logger::prelude::*;
 
-use crate::{PgError, PgResult};
+use crate::{Error, Result};
 
 /// Read buffer used for each file of a [`ChunkChain`].
 const CHAIN_BUF: usize = 16 << 20;
@@ -81,12 +95,12 @@ impl ChunkChain {
     ///
     /// Every path must exist and be readable; the error names the offending
     /// file.
-    pub fn new(paths: Vec<PathBuf>) -> PgResult<Self> {
+    pub fn new(paths: Vec<PathBuf>) -> Result<Self> {
         let mut total_len = 0u64;
         for p in &paths {
-            let md = fs::metadata(p).map_err(|e| PgError::io(p.clone(), e))?;
+            let md = fs::metadata(p).map_err(|e| Error::io(p.clone(), e))?;
             if !md.is_file() {
-                return Err(PgError::io(
+                return Err(Error::io(
                     p.clone(),
                     io::Error::new(io::ErrorKind::InvalidInput, "not a regular file"),
                 ));
@@ -106,9 +120,9 @@ impl ChunkChain {
     ///
     /// This is exactly `./builder.sh N`'s input selection. All `n` files are
     /// validated up front.
-    pub fn from_chunk_dir(dir: &Path, n: usize) -> PgResult<Self> {
+    pub fn from_chunk_dir(dir: &Path, n: usize) -> Result<Self> {
         if n == 0 {
-            return Err(PgError::other(
+            return Err(Error::other(
                 "the number of chunks must be at least 1".to_string(),
             ));
         }
@@ -116,7 +130,7 @@ impl ChunkChain {
         for i in 1..=n {
             let p = dir.join(format!("chunk_{i:02}.txt"));
             if !p.is_file() {
-                return Err(PgError::io(
+                return Err(Error::io(
                     p,
                     io::Error::new(io::ErrorKind::NotFound, "chunk file not found"),
                 ));
@@ -225,18 +239,18 @@ pub struct Boundaries {
 }
 
 /// Resolves a timezone name, accepting `utc` in any case.
-fn resolve_tz(name: &str) -> PgResult<Tz> {
+fn resolve_tz(name: &str) -> Result<Tz> {
     if name.eq_ignore_ascii_case("utc") {
         return Ok(Tz::UTC);
     }
     name.parse::<Tz>()
-        .map_err(|_| PgError::BadTimezone(name.to_string()))
+        .map_err(|_| Error::BadTimezone(name.to_string()))
 }
 
 /// Parses `YYYY-MM-DD` into its three components.
-fn parse_date(s: &str) -> PgResult<(i32, u32, u32)> {
+fn parse_date(s: &str) -> Result<(i32, u32, u32)> {
     let mut it = s.split('-');
-    let bad = || PgError::BadDate(s.to_string());
+    let bad = || Error::BadDate(s.to_string());
     let y = it.next().ok_or_else(bad)?;
     let m = it.next().ok_or_else(bad)?;
     let d = it.next().ok_or_else(bad)?;
@@ -250,12 +264,12 @@ fn parse_date(s: &str) -> PgResult<(i32, u32, u32)> {
 }
 
 /// Local midnight of `(y, m, d)` in `tz`, as a Unix timestamp.
-fn midnight(tz: Tz, y: i32, m: u32, d: u32) -> PgResult<i64> {
+fn midnight(tz: Tz, y: i32, m: u32, d: u32) -> Result<i64> {
     tz.with_ymd_and_hms(y, m, d, 0, 0, 0)
         .single()
         .map(|dt| dt.timestamp())
         .ok_or_else(|| {
-            PgError::other(format!(
+            Error::other(format!(
                 "{y:04}-{m:02}-{d:02} 00:00:00 does not exist exactly once in {tz}; \
                  pick another boundary or timezone"
             ))
@@ -274,10 +288,10 @@ fn midnight(tz: Tz, y: i32, m: u32, d: u32) -> PgResult<i64> {
 /// **only** because `END_TS == boundary[28]`; if `--end` were ever pushed past
 /// the last boundary, the final chunk would silently become a catch-all for
 /// everything after it. That is why a mismatch is
-/// [`PgError::BoundaryMismatch`] rather than a warning.
-pub fn compute_boundaries(opts: &SplitOpts) -> PgResult<Boundaries> {
+/// [`Error::BoundaryMismatch`] rather than a warning.
+pub fn compute_boundaries(opts: &SplitOpts) -> Result<Boundaries> {
     if opts.months == 0 {
-        return Err(PgError::other("--months must be at least 1"));
+        return Err(Error::other("--months must be at least 1"));
     }
     let tz = resolve_tz(&opts.tz)?;
     let (sy, sm, sd) = parse_date(&opts.start)?;
@@ -294,7 +308,7 @@ pub fn compute_boundaries(opts: &SplitOpts) -> PgResult<Boundaries> {
         upper.push(midnight(tz, y, m, 1)?);
         // A malformed range (e.g. a start after the end) must not spin.
         if upper.len() > 100_000 {
-            return Err(PgError::other(
+            return Err(Error::other(
                 "refusing to generate more than 100000 chunk boundaries",
             ));
         }
@@ -303,13 +317,13 @@ pub fn compute_boundaries(opts: &SplitOpts) -> PgResult<Boundaries> {
     match upper.last() {
         Some(last) if *last == end_ts => {}
         Some(last) => {
-            return Err(PgError::BoundaryMismatch {
+            return Err(Error::BoundaryMismatch {
                 last: *last,
                 end: end_ts,
             })
         }
         None => {
-            return Err(PgError::BoundaryMismatch {
+            return Err(Error::BoundaryMismatch {
                 last: start_ts,
                 end: end_ts,
             })
@@ -415,7 +429,7 @@ pub struct SplitStats {
 }
 
 /// Opens one chunk file, truncating or appending as requested.
-fn open_chunk(path: &Path, append: bool) -> PgResult<BufWriter<File>> {
+fn open_chunk(path: &Path, append: bool) -> Result<BufWriter<File>> {
     let mut o = OpenOptions::new();
     o.write(true).create(true);
     if append {
@@ -423,14 +437,14 @@ fn open_chunk(path: &Path, append: bool) -> PgResult<BufWriter<File>> {
     } else {
         o.truncate(true);
     }
-    let f = o.open(path).map_err(|e| PgError::io(path, e))?;
+    let f = o.open(path).map_err(|e| Error::io(path, e))?;
     Ok(BufWriter::with_capacity(SPLIT_WRITE_BUF, f))
 }
 
 /// Flushes, fsyncs and closes a chunk writer — the awk's `close()`, but with
 /// the errors actually checked.
-fn finish_chunk(mut w: BufWriter<File>, path: &Path) -> PgResult<()> {
-    w.flush().map_err(|e| PgError::io(path, e))?;
+fn finish_chunk(mut w: BufWriter<File>, path: &Path) -> Result<()> {
+    w.flush().map_err(|e| Error::io(path, e))?;
     // `fsync` is meaningless (and returns EINVAL) on a non-regular
     // destination; see `crate::sync_if_durable`.
     crate::sync_if_durable(w.get_ref(), path)?;
@@ -476,7 +490,7 @@ pub fn split<R: BufRead>(
     out_dir: &Path,
     opts: &SplitOpts,
     pl: &mut impl ProgressLog,
-) -> PgResult<SplitStats> {
+) -> Result<SplitStats> {
     let b = compute_boundaries(opts)?;
     let n = b.upper.len();
     let end_ts = *b
@@ -484,7 +498,7 @@ pub fn split<R: BufRead>(
         .last()
         .expect("compute_boundaries rejects an empty table");
 
-    fs::create_dir_all(out_dir).map_err(|e| PgError::io(out_dir, e))?;
+    fs::create_dir_all(out_dir).map_err(|e| Error::io(out_dir, e))?;
     let paths: Vec<PathBuf> = (1..=n)
         .map(|i| out_dir.join(format!("chunk_{i:02}.txt")))
         .collect();
@@ -543,7 +557,7 @@ pub fn split<R: BufRead>(
             Some(ts) => ts,
             None => {
                 let end = line.iter().position(|b| *b == b',').unwrap_or(line.len());
-                return Err(PgError::BadInteger {
+                return Err(Error::BadInteger {
                     line: line_no,
                     field: "timestamp",
                     value: String::from_utf8_lossy(&line[..end]).into_owned(),
@@ -593,7 +607,7 @@ pub fn split<R: BufRead>(
 
         let w = writer.as_mut().expect("a writer is open");
         w.write_all(&line)
-            .map_err(|e| PgError::io(&paths[current], e))?;
+            .map_err(|e| Error::io(&paths[current], e))?;
 
         let c = &mut stats.chunks[current];
         c.records += 1;
@@ -663,7 +677,7 @@ mod tests {
             ..Default::default()
         };
         match compute_boundaries(&opts) {
-            Err(PgError::BoundaryMismatch { last, end }) => {
+            Err(Error::BoundaryMismatch { last, end }) => {
                 assert!(last > end, "last {last} should overshoot end {end}");
             }
             other => panic!("expected BoundaryMismatch, got {other:?}"),
@@ -678,7 +692,7 @@ mod tests {
         };
         assert!(matches!(
             compute_boundaries(&opts),
-            Err(PgError::BadTimezone(_))
+            Err(Error::BadTimezone(_))
         ));
         let opts = SplitOpts {
             start: "2009/01/01".to_string(),
@@ -686,7 +700,7 @@ mod tests {
         };
         assert!(matches!(
             compute_boundaries(&opts),
-            Err(PgError::BadDate(_))
+            Err(Error::BadDate(_))
         ));
     }
 
@@ -848,7 +862,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("chunk_01.txt"), "x\n").unwrap();
         match ChunkChain::from_chunk_dir(dir.path(), 2) {
-            Err(PgError::Io { path, .. }) => {
+            Err(Error::Io { path, .. }) => {
                 assert!(path.ends_with("chunk_02.txt"), "got {}", path.display());
             }
             other => panic!("expected a named I/O error, got {other:?}"),

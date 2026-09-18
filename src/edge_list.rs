@@ -1,33 +1,44 @@
-//! Edge-list builder. A direct port of `PaymentGraphEdgeListBuilder.java` by
-//! **Matteo Loporchio**.
+//! Edge-list builder: the streaming pass that turns a transaction list into
+//! node ids and a raw arc stream.
+//!
+//! # Attribution
+//!
+//! The pipeline this stage belongs to, and the graph-construction algorithm it
+//! implements, are the work of **Matteo Loporchio**; what follows is an
+//! independent reimplementation of that design.
 //!
 //! The streaming loop registers a transaction's output nodes, resolves its
 //! inputs against the node map, emits the complete bipartite join of
-//! `inputs x outputs`, and reports Java-compatible statistics on stdout.
+//! `inputs x outputs`, and prints two summary lines on stdout.
 //!
-//! # What is reproduced bug-for-bug
+//! # The output contract
 //!
-//! * the `m x n` complete bipartite join (Java lines 69-80);
-//! * the exact emission order — line, then input index, then output offset —
-//!   so the raw TSV edge list is byte-identical to the Java reference;
+//! * the `m x n` complete bipartite join: `m` inputs and `n` outputs emit
+//!   exactly `m * n` arcs, with no pair omitted and none invented;
+//! * a fixed emission order — line, then input index, then output offset — so
+//!   the raw TSV edge list is byte-reproducible without any sorting, and is
+//!   pinned as such by the golden fixtures under `tests/data/reference`;
 //! * duplicate arcs and self-loops are emitted, never filtered (dedup happens
 //!   later, in `crate::arcs`);
-//! * `Nodes:` reports Java's `nodeCount`, which counts output **slots**;
+//! * `Nodes:` counts output **slots**, not distinct nodes; see [`print_stats`];
 //! * the final `Processed:` line duplicates the last progress line at exact
 //!   multiples of `--progress-every`;
 //! * elapsed seconds are measured from before the read loop and include
 //!   node-map writing.
 //!
-//! # What is deliberately fixed
+//! # The failure modes this stage refuses to have
 //!
-//! | Java line | behaviour | here |
-//! |---|---|---|
-//! | 59-60, 76-77 | empty output section ⇒ one phantom edge into node 0 | zero outputs ⇒ zero edges |
-//! | 54-55 | blank or short line ⇒ `ArrayIndexOutOfBoundsException` | skipped, or a line-numbered error |
-//! | 74 | dangling source ⇒ `NullPointerException`, both files 0 bytes | [`PgError::DanglingSource`] naming line, tx and pair; `--on-missing-source skip\|create` |
-//! | 44-45, 77, 93 | `PrintWriter` swallows every I/O error | every write checked, `sync_all` before the statistics |
-//! | 89-94 | node map in `HashMap` bucket order | ascending `(txId, offset)` |
-//! | 41 | a non-UTF-8 byte decodes to U+FFFD and is never reported | reported with its line and byte offset in strict mode, U+FFFD and a tally under `--lenient` |
+//! Every row is a way a streaming pass over 132 GB can lose or corrupt a
+//! multi-hour run without saying so, and the rule that prevents it:
+//!
+//! | input | what happens here |
+//! |---|---|
+//! | a transaction with an empty output section | zero outputs ⇒ zero edges, never a phantom edge into node `0` |
+//! | a blank or truncated line | skipped and tallied, or a line-numbered error — never an unchecked index into a short field list |
+//! | an input referencing an unregistered output | [`Error::DanglingSource`] naming the line, the transaction and the pair; `--on-missing-source skip\|create` to continue |
+//! | a disk-full while writing | every write checked and `sync_all`'d before the statistics, so a truncated file can never be reported as a success |
+//! | the node-map dump | ascending `(txId, offset)`, so two runs over one input produce byte-identical files |
+//! | a non-UTF-8 byte | reported with its line and byte offset in strict mode; U+FFFD and a tally under `--lenient` |
 //!
 //! This module deliberately depends on nothing outside `std` and this crate:
 //! no `webgraph`, no `rayon`, no `clap`, no `anyhow`.
@@ -43,7 +54,7 @@ use dsi_progress_logger::prelude::*;
 use crate::nodemap::DenseNodeMap;
 use crate::record::{self, ParseOpts};
 use crate::{
-    sync_if_durable, ArcSink, Mode, NodeId, OnMissingSource, PgError, PgResult, StatsStyle,
+    sync_if_durable, ArcSink, Error, Mode, NodeId, OnMissingSource, Result, StatsStyle,
     DEFAULT_PROGRESS_EVERY,
 };
 
@@ -79,18 +90,20 @@ impl Default for EdgeListOpts {
 
 /// Counters collected by [`build_edge_list`].
 ///
-/// `node_slots` is Java's `nodeCount` and `edge_count` is Java's `edgeCount`;
-/// everything else is new.
+/// `node_slots` and `edge_count` are the two the `Nodes:`/`Edges:` line
+/// reports; every other field exists so that a run which did something
+/// unexpected can say what, without being re-read.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct EdgeListStats {
-    /// Transactions processed (Java `txCount`): every line that parsed.
+    /// Transactions processed: every line that parsed.
     pub tx_count: u64,
-    /// Output **slots** (Java `nodeCount`, incremented at line 64 inside the
-    /// per-output loop without checking whether a node was actually created).
+    /// Output **slots**: incremented once per declared output, inside the
+    /// per-output loop, without checking whether that output actually created
+    /// a node. This is the number `Nodes:` prints; see [`print_stats`].
     pub node_slots: u64,
-    /// Distinct `(txId, offset)` nodes, i.e. Java's `nodes.size()`.
+    /// Distinct `(txId, offset)` nodes the node map actually holds.
     pub distinct_nodes: u64,
-    /// Emitted arcs, including duplicates and self-loops (Java `edgeCount`).
+    /// Emitted arcs, including duplicates and self-loops.
     pub edge_count: u64,
     /// Non-blank lines skipped because they were malformed (lenient mode).
     pub skipped_lines: u64,
@@ -101,8 +114,8 @@ pub struct EdgeListStats {
     /// Transactions with an empty output section.
     pub zero_output_txs: u64,
     /// Lines that were not valid UTF-8 and were decoded with U+FFFD
-    /// substitution, as Java's `InputStreamReader` did (lenient mode only;
-    /// strict mode reports [`PgError::InvalidUtf8`]).
+    /// substitution (lenient mode only; strict mode reports
+    /// [`Error::InvalidUtf8`]).
     pub non_utf8_lines: u64,
     /// Wall-clock seconds, truncated, measured from before the read loop.
     pub elapsed_secs: u64,
@@ -111,18 +124,18 @@ pub struct EdgeListStats {
 /// Runs the edge-list pass over `input`.
 ///
 /// Node ids are assigned through `node_map` and arcs are pushed into `sink` in
-/// Java's emission order; `sink.finish()` is called exactly once, on success.
+/// emission order; `sink.finish()` is called exactly once, on success.
 ///
 /// # Correctness properties
 ///
 /// * The graph is the **complete bipartite join**: a transaction with `m`
 ///   inputs and `n` outputs emits exactly `m * n` arcs. Verified on
 ///   `chunk_01.txt`: the sum over lines of `#inputs * #outputs` is 1094, which
-///   is what the Java program printed as `Edges:`.
+///   is exactly what this pass reports as `Edges:`.
 /// * Emission order is fully deterministic — line order, then input index,
 ///   then output offset — so the raw edge list is byte-reproducible without
 ///   any sorting. That is why the TSV sink's output can be compared
-///   byte-for-byte against the Java reference (`chunk_01` md5
+///   byte-for-byte against the stored reference edge list (`chunk_01` md5
 ///   `a3c31369f1a54bacfeb9b3cc2c953ebe`).
 /// * Duplicates and self-loops are emitted, not filtered.
 /// * A coinbase emits no arcs but still creates its output nodes — 18 445 of
@@ -130,24 +143,25 @@ pub struct EdgeListStats {
 ///
 /// # Timing
 ///
-/// The returned `elapsed_secs` covers the read loop **only**. Java measured
-/// its final elapsed time *after* writing the node map (line 95, following the
-/// dump at lines 89-94), so the caller must write the node map first and then
-/// call [`print_stats`] with `elapsed_secs` refreshed from a clock it owns.
+/// The returned `elapsed_secs` covers the read loop **only**, but the figure
+/// the `Processed:` line is expected to carry covers the node-map dump as
+/// well — at `N = 28` that dump is 55 GB and is not a rounding error. The
+/// caller must therefore write the node map first and only then call
+/// [`print_stats`], with `elapsed_secs` refreshed from a clock it owns.
 /// `main.rs` does exactly that and overwrites the field.
 ///
 /// # Progress
 ///
 /// `pl` is ticked once per transaction and is entirely separate from the
-/// `--progress-every` stdout line, which is a Java compatibility contract and
-/// is not a log. Pass `no_logging!()` to suppress it.
+/// `--progress-every` stdout line, which is part of the stdout format contract
+/// and is not a log. Pass `no_logging!()` to suppress it.
 pub fn build_edge_list<R: BufRead>(
     mut input: R,
     node_map: &mut DenseNodeMap,
     sink: &mut dyn ArcSink,
     opts: EdgeListOpts,
     pl: &mut impl ProgressLog,
-) -> PgResult<EdgeListStats> {
+) -> Result<EdgeListStats> {
     let start = Instant::now();
     // No `expected_updates`: the transaction count is one line per input line
     // and nothing has counted the lines. An estimate here would put a wrong
@@ -160,9 +174,10 @@ pub fn build_edge_list<R: BufRead>(
     // Bytes, not a `String`: `BufRead::read_line` validates UTF-8 and turns a
     // single stray byte anywhere in 132 GB into `ErrorKind::InvalidData`,
     // which named neither the file nor the line and which `--lenient` could
-    // not skip. Java's `InputStreamReader` substituted U+FFFD and carried on.
-    // Every field this parser reads is ASCII digits, so the validation pass is
-    // not needed for correctness either.
+    // not skip. Decoding by hand is what lets strict mode report the line and
+    // the byte offset, and lenient mode substitute U+FFFD and carry on. Every
+    // field this parser reads is ASCII digits, so the validation pass is not
+    // needed for correctness either.
     let mut line_buf: Vec<u8> = Vec::with_capacity(256);
     let mut stats = EdgeListStats::default();
     let mut line_no: u64 = 0;
@@ -179,12 +194,13 @@ pub fn build_edge_list<R: BufRead>(
             Ok(text) => Cow::Borrowed(text),
             Err(e) => {
                 if opts.mode == Mode::Strict {
-                    return Err(PgError::InvalidUtf8 {
+                    return Err(Error::InvalidUtf8 {
                         line: line_no,
                         offset: e.valid_up_to(),
                     });
                 }
-                // Lenient == Java: replace and keep going.
+                // Lenient: substitute and keep going. The offending bytes
+                // are almost always in a label field nobody parses.
                 stats.non_utf8_lines += 1;
                 String::from_utf8_lossy(&line_buf)
             }
@@ -202,10 +218,12 @@ pub fn build_edge_list<R: BufRead>(
             }
         };
 
-        // Java lines 59-65: the outputs are registered BEFORE the inputs are
-        // resolved, which is what makes a self-spend produce a self-loop.
+        // The outputs are registered BEFORE the inputs are resolved, which is
+        // what makes a transaction that spends one of its own outputs produce
+        // a self-loop rather than a dangling reference.
         node_map.register_tx(rec.tx_id, rec.num_outputs, line_no, &mut out_ids)?;
-        // Java line 64: incremented per output slot, unconditionally.
+        // Incremented per output slot, unconditionally — including for a slot
+        // a repeated transaction id already owns. See `node_slots`.
         stats.node_slots += rec.num_outputs as u64;
         if rec.num_outputs == 0 {
             stats.zero_output_txs += 1;
@@ -217,12 +235,14 @@ pub fn build_edge_list<R: BufRead>(
                 let src = match node_map.lookup(prev_tx, prev_off) {
                     Some(id) => id,
                     None => match opts.on_missing_source {
-                        // Java line 74: `nodes.get(...)` returned null and
-                        // auto-unboxing threw, killing the run and leaving both
-                        // output files at 0 bytes with a message that named
-                        // neither the line nor the transaction.
+                        // The lookup found nothing. Reported as a typed error
+                        // naming the line, the transaction, the input index
+                        // and the missing pair: the alternative is a run that
+                        // dies with both output files at 0 bytes behind a
+                        // message that names neither the line nor the
+                        // transaction.
                         OnMissingSource::Fail => {
-                            return Err(PgError::DanglingSource {
+                            return Err(Error::DanglingSource {
                                 line: line_no,
                                 tx_id: rec.tx_id,
                                 index,
@@ -240,7 +260,7 @@ pub fn build_edge_list<R: BufRead>(
                         }
                     },
                 };
-                // Java line 76: ascending output offset.
+                // Ascending output offset, so the emission order is fixed.
                 for &dst in out_ids.iter() {
                     sink.push(src, dst)?;
                     stats.edge_count += 1;
@@ -267,11 +287,13 @@ pub fn build_edge_list<R: BufRead>(
 
 /// Writes the node map to `path` and returns the number of bytes written.
 ///
-/// Java used `new PrintWriter(String)`, which never throws and whose
-/// `checkError()` was never called: a disk-full during a multi-hour run over
-/// 132 GB of chunks silently truncated the file while the program printed
-/// `Nodes: … Edges: …` and exited 0. Here every write is checked, and the file
-/// is flushed **and** `sync_all`'d before the caller prints its statistics.
+/// The trap this function exists to avoid is a writer whose errors are never
+/// looked at: a disk-full during a multi-hour run over 132 GB of chunks then
+/// truncates the node map silently, while the program goes on to print
+/// `Nodes: … Edges: …` and exit 0 — a successful-looking run whose output is
+/// short by however much did not fit. Here every write is checked, and the
+/// file is flushed **and** `sync_all`'d before the caller prints its
+/// statistics.
 ///
 /// `pl` counts **bytes**, because that is the only quantity this function sees
 /// incrementally: the node map is rendered by `DenseNodeMap::write_tsv` in one
@@ -281,8 +303,8 @@ pub fn write_node_map(
     node_map: &DenseNodeMap,
     path: &Path,
     pl: &mut impl ProgressLog,
-) -> PgResult<u64> {
-    let file = File::create(path).map_err(|e| PgError::io(path, e))?;
+) -> Result<u64> {
+    let file = File::create(path).map_err(|e| Error::io(path, e))?;
     pl.item_name("byte");
     // No path in the message: `path` here is the caller's atomic *temporary*
     // file, and every caller has already logged the destination it will be
@@ -300,7 +322,7 @@ pub fn write_node_map(
         written,
         pl,
     } = w;
-    inner.flush().map_err(|e| PgError::io(path, e))?;
+    inner.flush().map_err(|e| Error::io(path, e))?;
     // `fsync` on `/dev/null` or a fifo returns EINVAL; a fully written node
     // map must not be reported as a failure because of that.
     sync_if_durable(inner.get_ref(), path)?;
@@ -350,7 +372,7 @@ fn emit(line: &str) {
     let _ = lock.flush();
 }
 
-/// Prints Java's progress line (line 85) to **stdout**:
+/// Prints the periodic progress line to **stdout**:
 ///
 /// ```text
 /// Processed: {tx_count} transactions (after {elapsed_secs} seconds).
@@ -363,7 +385,7 @@ pub fn print_progress(tx_count: u64, elapsed_secs: u64) {
 
 /// Prints the final statistics to **stdout**.
 ///
-/// Under [`StatsStyle::Java`] exactly Java's two lines (97-98):
+/// Under [`StatsStyle::Brief`] exactly two lines:
 ///
 /// ```text
 /// Processed: {tx_count} transactions (after {elapsed_secs} seconds).
@@ -372,18 +394,21 @@ pub fn print_progress(tx_count: u64, elapsed_secs: u64) {
 ///
 /// The first line is unconditional and therefore **duplicates** the last
 /// progress line whenever `tx_count` is an exact multiple of the progress
-/// period — with the same count and a possibly larger elapsed time. That is
-/// Java's behaviour and it is preserved so a naive `diff` of the log keeps
-/// working.
+/// period — with the same count and a possibly larger elapsed time. It is
+/// emitted anyway, because these two lines are a stdout format contract: the
+/// historical pipeline logs in `logs/pg_el_builder.log` are expected to stay
+/// diffable against a fresh run, and suppressing the duplicate would put a
+/// spurious deletion in every such diff.
 ///
-/// `Nodes:` is Java's mislabelled `nodeCount`: it counts output **slots**, not
-/// distinct nodes, because line 64 incremented it without checking whether
-/// `getOrCreateId` created anything. The two differ by exactly the number of
-/// output slots belonging to a re-emitted transaction id — two, over the whole
-/// corpus, for the BIP-30 duplicate coinbases described in [`crate::nodemap`] —
-/// plus any node minted by [`crate::OnMissingSource::Create`]. `Nodes:` is
-/// reproduced as Java printed it; [`StatsStyle::Extended`] prints the honest
-/// count beside it.
+/// `Nodes:` counts output **slots**, not distinct nodes: the counter is
+/// bumped once per declared output, without checking whether that output
+/// created a node. The two differ by exactly the number of output slots
+/// belonging to a re-emitted transaction id — two, over the whole corpus, for
+/// the BIP-30 duplicate coinbases described in [`crate::nodemap`] — plus any
+/// node minted by [`crate::OnMissingSource::Create`]. The label is kept as it
+/// is for continuity with those logs, and nothing is hidden by it:
+/// [`StatsStyle::Extended`] prints **both** counts, the distinct-node count
+/// beside the slot count, so the discrepancy is visible on demand.
 ///
 /// Under [`StatsStyle::Extended`] two further lines follow with the corrected
 /// counters.
@@ -425,18 +450,20 @@ mod tests {
     }
 
     impl ArcSink for VecSink {
-        fn push(&mut self, src: NodeId, dst: NodeId) -> PgResult<()> {
+        fn push(&mut self, src: NodeId, dst: NodeId) -> Result<()> {
             self.arcs.push((src, dst));
             Ok(())
         }
-        fn finish(&mut self) -> PgResult<()> {
+        fn finish(&mut self) -> Result<()> {
             assert!(!self.finished, "finish() must be called exactly once");
             self.finished = true;
             Ok(())
         }
     }
 
-    fn run(input: &str, opts: EdgeListOpts) -> (EdgeListStats, Vec<(NodeId, NodeId)>, u64) {
+    /// The third element is the node map's `next_id`, i.e. a [`NodeId`] and
+    /// not a count — hence `NodeId` rather than the `u64` the statistics use.
+    fn run(input: &str, opts: EdgeListOpts) -> (EdgeListStats, Vec<(NodeId, NodeId)>, NodeId) {
         let mut map = DenseNodeMap::new(opts.mode);
         let mut sink = VecSink::new();
         let stats =
@@ -452,11 +479,12 @@ mod tests {
         }
     }
 
-    /// Java's `InputStreamReader` substituted U+FFFD and carried on; the port
-    /// used to abort the whole run with `stream did not contain valid UTF-8`,
-    /// naming neither the file nor the line, and `--lenient` could not skip it.
+    /// A lenient run substitutes U+FFFD and carries on. This pass used to
+    /// abort the whole run instead with `stream did not contain valid UTF-8`,
+    /// naming neither the file nor the line, and `--lenient` could not skip
+    /// it; strict mode now names both, and lenient mode only tallies it.
     #[test]
-    fn invalid_utf8_is_java_lossy_when_lenient_and_line_numbered_when_strict() {
+    fn invalid_utf8_is_lossy_when_lenient_and_line_numbered_when_strict() {
         let mut input: Vec<u8> = Vec::new();
         input.extend_from_slice(b"1231006505,0,0,1,0,204,0::0,5000000000,1\n");
         // A second, well-formed record whose trailing output label is garbage.
@@ -464,7 +492,8 @@ mod tests {
         input.extend_from_slice(&[0xFF, 0xFE]);
         input.extend_from_slice(b",1,1\n");
 
-        // Lenient: exactly Java. The bad bytes are in a field nobody parses.
+        // Lenient: the bad bytes are in a label field nobody parses, so the
+        // record still yields its arc.
         let mut map = DenseNodeMap::new(Mode::Lenient);
         let mut sink = VecSink::new();
         let stats = build_edge_list(
@@ -478,7 +507,7 @@ mod tests {
             },
             no_logging!(),
         )
-        .expect("lenient run survives a stray byte, as Java did");
+        .expect("a lenient run survives a stray byte");
         assert_eq!(stats.tx_count, 2);
         assert_eq!(stats.non_utf8_lines, 1);
         assert_eq!(sink.arcs, vec![(0, 1)]);
@@ -498,7 +527,7 @@ mod tests {
         )
         .expect_err("strict mode reports it");
         match err {
-            PgError::InvalidUtf8 { line, offset } => {
+            Error::InvalidUtf8 { line, offset } => {
                 assert_eq!(line, 2);
                 assert_eq!(offset, 32);
             }
@@ -540,9 +569,9 @@ mod tests {
 
     #[test]
     fn self_spend_yields_a_self_loop() {
-        // The outputs are registered before the inputs are resolved (Java
-        // lines 59-65 precede 68-81), so this resolves — exactly as the
-        // synthetic Java test `edge/t7.txt` did, which emitted `0\t0`.
+        // The outputs are registered before the inputs are resolved, so the
+        // lookup succeeds — the behaviour pinned by the `edge/t7.txt`
+        // fixture, whose expected edge list is the single arc `0\t0`.
         let input = "1,0,0,0,0,0,0:h,5,0,0:a,1,1\n";
         let (stats, arcs, _) = run(input, quiet());
         assert_eq!(arcs, vec![(0, 0)]);
@@ -551,8 +580,8 @@ mod tests {
 
     #[test]
     fn duplicate_inputs_emit_duplicate_arcs() {
-        // Java `edge/t8.txt` printed the same pair twice; dedup is the sorter's
-        // job, not this stage's.
+        // The `edge/t8.txt` fixture contains the same pair twice; dedup is
+        // the sorter's job, not this stage's.
         let input = "1,0,0,1,0,0,0::a,1,1\n\
                      2,1,1,0,0,0,0:x,5,0,0;y,5,0,0:b,2,2\n";
         let (_, arcs, _) = run(input, quiet());
@@ -561,10 +590,11 @@ mod tests {
 
     #[test]
     fn zero_outputs_emit_no_edge_into_node_zero() {
-        // Java sized `currentOutputNodeIds` as `outputs.length`, and
-        // `"".split(";")` has length 1, so the array stayed `{0}` and every
-        // input of such a line emitted a phantom edge into the genesis output
-        // (lines 59-60 and 76-77). Here zero outputs means zero edges.
+        // The trap: an empty output section still splits into one (empty)
+        // field, so sizing the output-id buffer from that field count leaves
+        // a leftover `0` in it, and every input of such a line then emits a
+        // phantom edge into the genesis output. The buffer is cleared and
+        // filled by `register_tx` instead, so zero outputs means zero edges.
         let input = "1,0,0,1,0,0,0::a,1,1\n\
                      2,1,1,0,0,0,0:x,5,0,0::trailing\n";
         let opts = EdgeListOpts {
@@ -600,7 +630,7 @@ mod tests {
             quiet(),
             no_logging!(),
         ) {
-            Err(PgError::DanglingSource {
+            Err(Error::DanglingSource {
                 line: 2,
                 tx_id: 1,
                 index: 0,
@@ -665,7 +695,7 @@ mod tests {
         let mut map = DenseNodeMap::new(Mode::Strict);
         let mut sink = VecSink::new();
         match build_edge_list(input.as_bytes(), &mut map, &mut sink, opts, no_logging!()) {
-            Err(PgError::ForwardForcedNode {
+            Err(Error::ForwardForcedNode {
                 line: 1,
                 tx_id: 5,
                 offset: 0,
@@ -700,7 +730,7 @@ mod tests {
             quiet(),
             no_logging!(),
         ) {
-            Err(PgError::BadSectionCount { line: 2, found: 1 }) => {}
+            Err(Error::BadSectionCount { line: 2, found: 1 }) => {}
             other => panic!("expected BadSectionCount, got {other:?}"),
         }
     }

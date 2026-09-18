@@ -3,8 +3,8 @@ name = "utxo2webgraph"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
-description = "Bitcoin Payment Graph pipeline: transaction list -> node map + edge list -> BVGraph"
-authors = ["Ported from the Java pipeline by Matteo Loporchio"]
+description = "Bitcoin payment graph: transaction list -> node map + edge list -> BVGraph"
+authors = ["Pipeline and graph-construction algorithm by Matteo Loporchio"]
 license = "Apache-2.0 OR MIT"
 publish = false
 
@@ -13,14 +13,16 @@ name = "utxo2webgraph"
 path = "src/lib.rs"
 
 [[bin]]
-name = "pgraph"
+name = "utxo2webgraph"
 path = "src/main.rs"
 
 [dependencies]
 # webgraph-rs, pinned to the exact upstream commit this port was verified
 # against (vigna/webgraph-rs main @ f8698a7, version 0.6.1). Pinning the rev
 # keeps the BVGraph output reproducible: the differential test in
-# tests/golden.rs compares it byte for byte against the Java reference.
+# `compress`'s own unit test pins the compressed bitstream byte for byte
+# against a golden vector, and tests/golden.rs pins the node map and edge list
+# against recorded reference fixtures.
 #
 # HTTPS rather than ssh://git@github.com/vigna/webgraph-rs.git so that a clone
 # builds without a GitHub SSH key. The two URLs are the same repository; swap
@@ -69,7 +71,7 @@ debug           = true
 overflow-checks = true
 # NOTE: do NOT set `panic = "abort"`. The sequential webgraph path asserts
 # rather than errors on unsorted input (arc_list_graph.rs:162, :261), and
-# compress.rs wraps it in catch_unwind to turn that into a typed PgError.
+# compress.rs wraps it in catch_unwind to turn that into a typed Error.
 
 [profile.fast]
 inherits        = "release"

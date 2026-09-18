@@ -1,24 +1,31 @@
-//! Node map. Ported from `PaymentGraphEdgeListBuilder.java` by
-//! **Matteo Loporchio** (lines 15-25), which used `HashMap<Long, Long>` keyed
-//! on `pack(txId, offset)`:
+//! Node map: the dense [`NodeId`] assigned to every transaction output.
 //!
-//! ```java
-//! public static long getOrCreateId(long key) {
-//!     long id = nodes.getOrDefault(key, -1L);
-//!     if (id == -1) { id = nextId++; nodes.put(key, id); }
-//!     return id;
-//! }
+//! The obvious implementation is a hash map from the packed `(txId, offset)`
+//! key ([`crate::pack`]) to an id, minting a fresh id the first time a key is
+//! seen:
+//!
+//! ```text
+//! get_or_create(key):
+//!     if key in nodes { return nodes[key] }
+//!     id = next_id; next_id += 1; nodes[key] = id; return id
 //! ```
 //!
-//! [`DenseNodeMap`] is the one implementation. It exploits the near-density of
-//! `txId` — which is the zero-based line number of the master transaction list
-//! — to replace Java's `HashMap<Long, Long>` with a single prefix-sum
-//! `Vec<u64>`, and it handles every input the corpus actually contains,
-//! including the repeats described below. A literal `HashMap` port used to live
-//! here as a second, flag-selected map; it was deleted once the dense map
-//! subsumed it, and the unit test
-//! `dense_matches_a_java_getorcreateid_oracle_on_a_long_random_run` plus the
-//! `chunk_01`-wide differential in `tests/golden.rs` keep the cross-check.
+//! [`DenseNodeMap`] is the one implementation, and it computes exactly that
+//! function without the map. It exploits the near-density of `txId` — which is
+//! the zero-based line number of the master transaction list — to replace one
+//! hash entry per output with a single prefix-sum `Vec<NodeId>`, and it handles
+//! every input the corpus actually contains, including the repeats described
+//! below. A literal hash-backed map used to live here as a second,
+//! flag-selected implementation; it was deleted once the dense map subsumed it,
+//! and the unit test `dense_matches_a_get_or_create_oracle_on_a_long_random_run`
+//! plus the `chunk_01`-wide differential in `tests/golden.rs` keep the
+//! cross-check against `get_or_create` semantics alive.
+//!
+//! # Attribution
+//!
+//! The pipeline and the graph-construction algorithm this module implements
+//! are the work of **Matteo Loporchio**; this is an independent
+//! reimplementation of that design.
 //!
 //! # BIP-30: a `txId` may legitimately repeat, and may go *backwards*
 //!
@@ -31,18 +38,18 @@
 //! occurrence, and `142572` re-emitted 267 lines later — inside an otherwise
 //! perfectly consecutive `0..778_613_437`.
 //!
-//! Java's `getOrCreateId` handled this without noticing: a key already in the
-//! map keeps its original id and `nextId` does not move. [`DenseNodeMap`] now
-//! does the same (see [`DenseNodeMap::register_tx`]), in **both**
-//! [`Mode::Strict`] and [`Mode::Lenient`] — a BIP-30 duplicate is legitimate
-//! data, not corruption, so it must not require `--lenient`. Only a *forward*
-//! `txId` gap is still an anomaly, and that is where [`Mode`] still bites.
+//! `get_or_create` handles this without noticing: a key already in the map
+//! keeps its original id and `next_id` does not move. [`DenseNodeMap`] does the
+//! same (see [`DenseNodeMap::register_tx`]), in **both** [`Mode::Strict`] and
+//! [`Mode::Lenient`] — a BIP-30 duplicate is legitimate data, not corruption,
+//! so it must not require `--lenient`. Only a *forward* `txId` gap is still an
+//! anomaly, and that is where [`Mode`] still bites.
 
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::io::Write;
 
-use crate::{pack, unpack, Mode, NodeId, PgError, PgResult};
+use crate::{pack, unpack, Error, Mode, NodeId, Result};
 
 /// Bytes buffered before flushing to the writer in [`DenseNodeMap::write_tsv`].
 const TSV_BUF: usize = 1 << 16;
@@ -50,27 +57,27 @@ const TSV_BUF: usize = 1 << 16;
 /// Largest forward `txId` jump [`DenseNodeMap`] will bridge in
 /// [`Mode::Lenient`] before giving up.
 ///
-/// The fill costs one `u64` per skipped id. Unbounded, a single corrupt record
-/// was catastrophic: a two-line, 79-byte input whose second `txId` is
-/// `2_147_483_647` drove RSS to 16 GiB in 16 s, and under `ulimit -v` the
-/// process *aborted* (`memory allocation of 67108864 bytes failed`, exit 134)
-/// rather than returning the typed error the rest of the crate promises. Java's
-/// `HashMap` simply inserted one entry, so that was the port being strictly
-/// worse than the reference on the very input class `--lenient` exists to
-/// survive.
+/// The fill costs one [`NodeId`] — eight bytes — per skipped id. Unbounded, a
+/// single corrupt record was catastrophic: a two-line, 79-byte input whose
+/// second `txId` is `2_147_483_647` drove RSS to 16 GiB in 16 s, and under
+/// `ulimit -v` the process *aborted* (`memory allocation of 67108864 bytes
+/// failed`, exit 134) rather than returning the typed error the rest of the
+/// crate promises. A hash-backed map would simply have inserted one entry for
+/// that line, so the dense layout was strictly worse than the implementation it
+/// replaced on the very input class `--lenient` exists to survive.
 ///
 /// 2^20 ids is 8 MiB of filler — far beyond any plausible gap in a corpus
 /// whose txIds are globally consecutive (verified `0..778_613_437` across all
 /// 28 chunks, modulo the two BIP-30 *backwards* repeats, which are not gaps) —
 /// and anything larger is a corrupt file, not a gap. Such a line raises
-/// [`PgError::NonDenseTxId`] rather than being bridged.
+/// [`Error::NonDenseTxId`] rather than being bridged.
 pub const MAX_TX_GAP: i64 = 1 << 20;
 
 // ---------------------------------------------------------------------------
 // DenseNodeMap
 // ---------------------------------------------------------------------------
 
-/// Node map backed by a single `Vec<u64>` indexed by transaction id.
+/// Node map backed by a single `Vec<NodeId>` indexed by transaction id.
 ///
 /// **The invariant it relies on, verified over the whole corpus:** `txId` is
 /// strictly increasing by exactly 1, starting at 0, with no gaps, globally
@@ -87,49 +94,49 @@ pub const MAX_TX_GAP: i64 = 1 << 20;
 /// ```
 ///
 /// with `base` the prefix sum of the per-transaction output counts. Cost at
-/// N=28: `778.6e6 * 8 = 6.23 GB`, versus 140-160 GB for the Java
-/// `HashMap<Long, Long>` (a `Node` object plus two boxed `Long`s per entry) —
-/// which is what `-Xmx200g` was actually paying for. Elias-Fano would compress
-/// `base` to about 340 MB, but it is not incrementally appendable and 6.2 GB
-/// out of 503 GB is free, so it is deliberately not done.
+/// N=28: `778.6e6 * 8 = 6.23 GB`, versus 140-160 GB for a map carrying one
+/// entry per output — which is what the historical pipeline's 200 GB heap was
+/// actually paying for. Elias-Fano would compress `base` to about 340 MB, but
+/// it is not incrementally appendable and 6.2 GB out of 503 GB is free, so it
+/// is deliberately not done.
 ///
-/// The element type is `u64`, not `u32`: the node count at N=28 is about
-/// 2.21e9, which does fit in a `u32` but with only a 1.94x margin against an
-/// estimate carrying +/-20% uncertainty. Three gigabytes are not worth that
-/// cliff.
+/// The element type is [`NodeId`] — `usize`, eight bytes on every target this
+/// crate builds for — and deliberately not a narrowed `u32`: the node count at
+/// N=28 is about 2.21e9, which does fit in a `u32` but with only a 1.94x margin
+/// against an estimate carrying +/-20% uncertainty. Three gigabytes are not
+/// worth that cliff, and `usize` is the type the compressor consumes, so an id
+/// read out of `base` crosses into `webgraph-rs` without a cast.
 ///
 /// **The invariant is verified at runtime, never assumed.** A *forward* jump
-/// is [`PgError::NonDenseTxId`] in [`Mode::Strict`], and a bridged gap in
+/// is [`Error::NonDenseTxId`] in [`Mode::Strict`], and a bridged gap in
 /// [`Mode::Lenient`] (up to [`MAX_TX_GAP`]). A *backwards* `txId` is not an
 /// error at all: it is the BIP-30 duplicate-coinbase case described in the
 /// module documentation, and [`DenseNodeMap::register_tx`] reuses the ids the
-/// first occurrence was given, exactly as Java's `getOrCreateId` did.
+/// first occurrence was given, exactly as `get_or_create` would.
 ///
 /// # The contract it obeys
-///
-/// Taken from the Java:
 ///
 /// * ids are dense, gapless and monotonically increasing from 0, assigned in
 ///   **first-appearance order** — input line order and, within a line, output
 ///   offset `0, 1, 2, …` ascending;
-/// * **output nodes are the only nodes ever created.** Java line 63 is the one
-///   and only `getOrCreateId` call site; line 74 (`nodes.get(sourceNodeKey)`)
-///   is a pure lookup that inserts nothing, which is exactly why a dangling
-///   input reference made the reference implementation throw
-///   `NullPointerException` instead of minting a node;
-/// * a line's outputs are registered **before** its inputs are resolved
-///   (Java lines 59-65 precede 68-81), so a transaction spending its own output
-///   resolves and yields a **self-loop**. Real data never does this (verified:
-///   0 self-references and 0 forward references across all of `chunk_05`), but
-///   the port must not "optimise" on that assumption — the synthetic Java test
-///   `edge/t7.txt` really does emit `0\t0`.
+/// * **output nodes are the only nodes ever created.** Registering a
+///   transaction's outputs is the one and only mint site; resolving an input is
+///   a pure lookup ([`DenseNodeMap::lookup`]) that inserts nothing, which is
+///   exactly why a dangling input reference is the typed
+///   [`Error::DanglingSource`] rather than a silently minted node;
+/// * a line's outputs are registered **before** its inputs are resolved, so a
+///   transaction spending its own output resolves and yields a **self-loop**.
+///   Real data never does this (verified: 0 self-references and 0 forward
+///   references across all of `chunk_05`), but the implementation must not
+///   "optimise" on that assumption — the synthetic fixture `edge/t7.txt` really
+///   does emit `0\t0`.
 pub struct DenseNodeMap {
     /// Sentinel prefix sum: `base[i]` is the id of output 0 of transaction
     /// `min_tx + i`, and the final element is always equal to `next_id`.
     /// Hence `base.len() == number_of_transactions + 1` once started.
-    base: Vec<u64>,
-    /// Java's `nextId`.
-    next_id: u64,
+    base: Vec<NodeId>,
+    /// One past the highest id handed out so far.
+    next_id: NodeId,
     /// The transaction id of `base[0]`. 0 for the standard pipeline.
     min_tx: i64,
     /// Strict/lenient behaviour for a non-dense transaction id.
@@ -137,6 +144,10 @@ pub struct DenseNodeMap {
     /// Nodes minted by [`DenseNodeMap::force_create`], or by a repeat that
     /// declared more outputs than the first occurrence did, keyed by [`pack`].
     /// Empty on every path except `--on-missing-source create`.
+    ///
+    /// The key half stays `u64` while the value is a [`NodeId`]: the key is a
+    /// [`pack`] key in the *input's* coordinates, not an id, and [`MulShift`]
+    /// hashes it through `write_u64` alone.
     extra: HashMap<u64, NodeId, BuildMulShift>,
     /// For each minted node, the number of transactions registered at the time
     /// it was minted. A phantom recorded with value `k` occupies an id inside
@@ -184,6 +195,10 @@ impl DenseNodeMap {
     ///
     /// Derived from the prefix sum as `base[i + 1] - base[i]`, so it costs no
     /// extra storage. The `next_id` sentinel closes the last entry.
+    ///
+    /// `u32`, not [`NodeId`]: this is an output count in the input format's own
+    /// terms — the same width [`crate::record::count_outputs`] produces — and
+    /// not an id.
     pub fn num_outputs(&self, tx_id: i32) -> Option<u32> {
         let i = self.index_of(tx_id)?;
         Some(self.outputs_at(i) as u32)
@@ -203,7 +218,7 @@ impl DenseNodeMap {
     /// Output count of the transaction at `base` index `i`, discounting any
     /// force-created nodes that were minted inside its id interval.
     #[inline]
-    fn outputs_at(&self, i: usize) -> u64 {
+    fn outputs_at(&self, i: usize) -> usize {
         let raw = self.base[i + 1] - self.base[i];
         if self.phantom_at.is_empty() {
             return raw;
@@ -213,11 +228,11 @@ impl DenseNodeMap {
 
     /// How many force-created nodes fall inside transaction `i`'s id interval.
     #[inline]
-    fn phantoms_in(&self, i: usize) -> u64 {
+    fn phantoms_in(&self, i: usize) -> usize {
         let key = i + 1;
         let lo = self.phantom_at.partition_point(|v| *v < key);
         let hi = self.phantom_at.partition_point(|v| *v <= key);
-        (hi - lo) as u64
+        hi - lo
     }
 }
 
@@ -225,25 +240,25 @@ impl DenseNodeMap {
     /// Registers the outputs of one transaction, appending their node ids to
     /// `out` in ascending offset order.
     ///
-    /// `out` is cleared first and then receives exactly `num_outputs` ids; it
-    /// is Java's `long[] currentOutputNodeIds` (lines 59-65), passed in by the
-    /// caller so one buffer can be reused for the whole run. `num_outputs == 0`
-    /// leaves `out` empty — that is the fix for the phantom-edge bug described
-    /// in [`crate::record::count_outputs`], where Java's `new long[1]` kept its
-    /// default `{0}` and every input emitted an edge into the genesis output.
+    /// `out` is cleared first and then receives exactly `num_outputs` ids; the
+    /// caller owns the buffer so that one allocation serves the whole run.
+    /// `num_outputs == 0` leaves `out` empty — that is the fix for the
+    /// phantom-edge bug described in [`crate::record::count_outputs`], where a
+    /// one-element buffer kept its default `0` and every input emitted an edge
+    /// into the genesis output.
     ///
     /// A `tx_id` *below* the dense cursor is a repeat (BIP-30; see the module
     /// documentation) and is delegated to `register_repeat`,
     /// which mints nothing for the offsets the first occurrence already owns.
     ///
-    /// `line` is only used to build [`PgError::NonDenseTxId`].
+    /// `line` is only used to build [`Error::NonDenseTxId`].
     pub fn register_tx(
         &mut self,
         tx_id: i32,
         num_outputs: u32,
         line: u64,
         out: &mut Vec<NodeId>,
-    ) -> PgResult<()> {
+    ) -> Result<()> {
         out.clear();
 
         if self.base.is_empty() {
@@ -254,13 +269,14 @@ impl DenseNodeMap {
             let found = tx_id as i64;
             if found < expected {
                 // The dense cursor has already passed this txId: it is a
-                // REPEAT, not corruption — see the module docs on BIP-30. Java
-                // silently kept the original ids, and so do we, in both modes.
+                // REPEAT, not corruption — see the module docs on BIP-30.
+                // `get_or_create` silently keeps the original ids, and so do
+                // we, in both modes.
                 return self.register_repeat(tx_id, num_outputs, line, out);
             }
             if found != expected {
                 if self.mode == Mode::Strict {
-                    return Err(PgError::NonDenseTxId {
+                    return Err(Error::NonDenseTxId {
                         line,
                         expected,
                         found,
@@ -274,7 +290,7 @@ impl DenseNodeMap {
                     // from the strict-mode one above, because the operator is
                     // already running with `--lenient` and must not be told to
                     // re-run with it.
-                    return Err(PgError::TxIdGapTooLarge {
+                    return Err(Error::TxIdGapTooLarge {
                         line,
                         expected,
                         found,
@@ -292,7 +308,7 @@ impl DenseNodeMap {
                 // surface as a typed error, not as an `abort()` that no
                 // caller can catch.
                 self.base.try_reserve(gap as usize).map_err(|_| {
-                    PgError::other(format!(
+                    Error::other(format!(
                         "line {line}: transaction id {found} skips ahead of {expected}; \
                          filling the {gap}-id gap needs {} bytes, which could not be \
                          allocated; the input's transaction ids are not consecutive",
@@ -308,11 +324,11 @@ impl DenseNodeMap {
 
         debug_assert_eq!(*self.base.last().unwrap(), self.next_id);
         let start = self.next_id;
-        self.next_id = start + num_outputs as u64;
+        self.next_id = start + num_outputs as usize;
         self.base.push(self.next_id);
 
         out.reserve(num_outputs as usize);
-        for k in 0..num_outputs as u64 {
+        for k in 0..num_outputs as usize {
             out.push(start + k);
         }
         Ok(())
@@ -320,8 +336,8 @@ impl DenseNodeMap {
 
     /// Re-registers a transaction the dense cursor has already passed.
     ///
-    /// This is Java's `getOrCreateId` on a key that is already in the map: the
-    /// original id comes back and `nextId` does **not** move. Two things follow
+    /// This is `get_or_create` on a key that is already in the map: the
+    /// original id comes back and `next_id` does **not** move. Two things follow
     /// from the layout, and both matter:
     ///
     /// * the offsets the first occurrence already owns — `0 .. k0`, where `k0`
@@ -334,7 +350,7 @@ impl DenseNodeMap {
     ///   [`DenseNodeMap::lookup`] calls.
     /// * offsets `k0 ..` — only reachable when a repeat declares *more* outputs
     ///   than the original did, which the corpus never does — were never in the
-    ///   Java map either, so they are minted through
+    ///   map either, so they are minted through
     ///   [`DenseNodeMap::force_create`] into `extra`. That cannot alias a later
     ///   dense mint, because this path is only entered for a `tx_id` strictly
     ///   *behind* the cursor, which never revisits it; a txId *below* `min_tx`
@@ -349,7 +365,7 @@ impl DenseNodeMap {
         num_outputs: u32,
         line: u64,
         out: &mut Vec<NodeId>,
-    ) -> PgResult<()> {
+    ) -> Result<()> {
         out.reserve(num_outputs as usize);
         // `outputs_at`, not the raw `base[i+1] - base[i]`: force-created nodes
         // sit at the tail of a transaction's id interval, and they are not its
@@ -360,11 +376,11 @@ impl DenseNodeMap {
             // Below the rebase floor `min_tx`, so nothing to reuse.
             None => (0, 0),
         };
-        let reused = k0.min(num_outputs as u64);
+        let reused = k0.min(num_outputs as usize);
         for k in 0..reused {
             out.push(start + k);
         }
-        for offset in reused..num_outputs as u64 {
+        for offset in reused..num_outputs as usize {
             let id = self.force_create(tx_id, offset as i32, line)?;
             out.push(id);
         }
@@ -373,15 +389,17 @@ impl DenseNodeMap {
 
     /// Resolves a previously registered output. **Never inserts.**
     ///
-    /// `None` is the dangling reference that made Java throw at line 74. A
-    /// `tx_id` that appeared twice resolves to the ids of its **first**
+    /// `None` is the dangling reference [`Error::DanglingSource`] is built
+    /// from: the input side of a transaction only ever looks an output up, so a
+    /// reference the map cannot answer is a fact about the input, not a node to
+    /// mint. A `tx_id` that appeared twice resolves to the ids of its **first**
     /// occurrence, because the dense hit is preferred over `extra`.
     pub fn lookup(&self, tx_id: i32, offset: i32) -> Option<NodeId> {
         if offset >= 0 {
             if let Some(i) = self.index_of(tx_id) {
                 let n = self.outputs_at(i);
-                if (offset as u64) < n {
-                    return Some(self.base[i] + offset as u64);
+                if (offset as usize) < n {
+                    return Some(self.base[i] + offset as usize);
                 }
             }
         }
@@ -397,9 +415,9 @@ impl DenseNodeMap {
     /// Used by [`crate::OnMissingSource::Create`] and by
     /// `register_repeat`'s overflow path. Calling it from
     /// `OnMissingSource::Create` **changes the id space**, and therefore every
-    /// id in both output files: a run that used it is not comparable with a
-    /// Java reference run, and the node map it produces describes a different
-    /// graph labelling. Repeated calls with the same key return the same id.
+    /// id in both output files: a run that used it is not comparable with a run
+    /// that did not, and the node map it produces describes a different graph
+    /// labelling. Repeated calls with the same key return the same id.
     ///
     /// # Why `tx_id` must be behind the cursor
     ///
@@ -414,17 +432,17 @@ impl DenseNodeMap {
     /// cursor and the cursor will later mint a **second** id for it —
     /// [`DenseNodeMap::lookup`] would then prefer the dense one, `write_tsv`
     /// would emit the key twice and out of order, and `distinct_nodes` would
-    /// over-count. So a forward `tx_id` is [`PgError::ForwardForcedNode`],
+    /// over-count. So a forward `tx_id` is [`Error::ForwardForcedNode`],
     /// never a silent second id. `register_repeat` only ever calls this for a
     /// `tx_id` strictly below the cursor, so it can never trip the check.
-    pub fn force_create(&mut self, tx_id: i32, offset: i32, line: u64) -> PgResult<NodeId> {
+    pub fn force_create(&mut self, tx_id: i32, offset: i32, line: u64) -> Result<NodeId> {
         // The highest txId that already owns a dense slot. `base.len() - 1` is
         // the transaction count, so this is `min_tx - 1` (i.e. "nothing") for
         // an empty map, where the very first `register_tx` is still free to
         // plant `min_tx` anywhere.
         let reached = self.min_tx + self.base.len().saturating_sub(1) as i64 - 1;
         if self.base.is_empty() || tx_id as i64 > reached {
-            return Err(PgError::ForwardForcedNode {
+            return Err(Error::ForwardForcedNode {
                 line,
                 tx_id,
                 offset,
@@ -446,12 +464,24 @@ impl DenseNodeMap {
         Ok(id)
     }
 
-    /// Java's `nextId`: one past the highest id handed out so far.
+    /// One past the highest id handed out so far: the id the next mint would
+    /// use.
+    ///
+    /// A [`NodeId`], because that is what it is — an id, not a tally. The
+    /// count-shaped view of the same number is [`DenseNodeMap::distinct_nodes`].
     pub fn next_id(&self) -> NodeId {
         self.next_id
     }
 
-    /// Java's `nodes.size()`: the number of distinct `(txId, offset)` keys.
+    /// The number of distinct `(txId, offset)` keys that have ever been given
+    /// an id.
+    ///
+    /// Returns `u64`, not [`NodeId`], and the cast below is deliberate: this is
+    /// a **statistic**, not an id. It is what `EdgeListStats::distinct_nodes`
+    /// carries and what the golden tests compare, alongside arc counts, line
+    /// counts and byte counts that are all `u64` regardless of the target's
+    /// pointer width. Widening here keeps every counter in the crate one type,
+    /// and keeps a statistics line from changing shape on a 32-bit host.
     pub fn distinct_nodes(&self) -> u64 {
         // Every id ever handed out corresponds to a distinct key. Three
         // mint sites, and none of them can allocate twice for one key:
@@ -461,28 +491,30 @@ impl DenseNodeMap {
         //   * `register_repeat` mints nothing for the offsets that index
         //     already owns (it hands back the ids it finds there), so a
         //     repeated `(txId, offset)` adds no id at all — which is exactly
-        //     Java's `getOrCreateId` leaving `nextId` alone;
+        //     `get_or_create` leaving `next_id` alone;
         //   * `force_create` de-duplicates against everything already minted,
         //     through `lookup`, and — this is the part that makes the dense
         //     path's refusal to probe `extra` sound — refuses outright any
         //     `txId` the cursor has not yet passed
-        //     (`PgError::ForwardForcedNode`). So a forced key is always one
+        //     (`Error::ForwardForcedNode`). So a forced key is always one
         //     the dense path is finished with and will never mint again.
         // Gap filler transactions have zero outputs and mint nothing.
-        self.next_id
+        self.next_id as u64
     }
 
     /// Writes the node map as `txId\toffset\tid`, LF-terminated, no header, in
     /// **ascending `(txId, offset)`** order, each key exactly once.
     ///
-    /// Java iterated `nodes.keySet()` (lines 89-94), i.e. `HashMap` bucket
-    /// order. That is deterministic for a fixed JVM but is *not* a
-    /// specification: `chunk_01`'s reference node map has 23 descents in the id
-    /// column and 5 in the txId column, so it merely *looks* sorted. This
-    /// ordering is deterministic, portable and streams straight out of the
-    /// dense base array. Any consumer that byte-diffed the old `pg_nm_N.tsv`
-    /// will see a different file with an identical *set* of triples; compare
-    /// with `sort -t$'\t' -k1,1n -k2,2n | md5sum`
+    /// The ordering is a promise this function makes, not an accident of the
+    /// data structure. A map-backed implementation emits its keys in whatever
+    /// order the hash table's buckets happen to be in — reproducible for one
+    /// fixed implementation, but not a specification, and not portable across
+    /// two of them. `chunk_01`'s reference node map has 23 descents in the id
+    /// column and 5 in the txId column, so it merely *looks* sorted. Ascending
+    /// `(txId, offset)` is deterministic, portable, and streams straight out of
+    /// the dense base array. Any consumer that byte-diffed the old
+    /// `pg_nm_N.tsv` will see a different file with an identical *set* of
+    /// triples; compare with `sort -t$'\t' -k1,1n -k2,2n | md5sum`
     /// (`4795d0ab4a84e775d16c7b57e26d2fc9` for `chunk_01`).
     ///
     /// A repeated `txId` contributes no extra row: the ids were emitted for its
@@ -492,7 +524,7 @@ impl DenseNodeMap {
     /// cursor: an `extra` key is therefore either below `min_tx` or an offset
     /// past the end of a transaction's own run, and in both cases the merge
     /// below interleaves it without ever colliding with a dense row.
-    pub fn write_tsv(&self, w: &mut dyn Write) -> PgResult<()> {
+    pub fn write_tsv(&self, w: &mut dyn Write) -> Result<()> {
         let mut extras: Vec<(i32, i32, NodeId)> = self
             .extra
             .iter()
@@ -543,6 +575,14 @@ impl DenseNodeMap {
 /// almost none in the lower 32 (the output offset, virtually always < 10), so
 /// the default SipHash roughly doubles the pass time while a single multiply
 /// plus xor-shift mixes both words well enough for a power-of-two table.
+///
+/// **Only `write_u64` is implemented, and that pins the key type.** A
+/// `HashMap` keyed on anything else — a `usize`, a tuple, a `&str` — would hash
+/// through the byte-wise `write` below, which mixes one byte at a time and is
+/// not the function this type was measured as. The side table's key is
+/// therefore `u64` ([`pack`]) and stays `u64` even though its *values* are
+/// `usize` node ids; the `debug_assert!` in `write` is there to make a mistaken
+/// key type fail loudly in tests rather than quietly get slower in production.
 #[derive(Default, Clone, Copy)]
 struct MulShift {
     state: u64,
@@ -589,7 +629,7 @@ fn push_row(buf: &mut Vec<u8>, tx: i32, offset: i32, id: NodeId) {
 
 /// Flushes `buf` into `w` once it has grown past [`TSV_BUF`].
 #[inline]
-fn flush_if_full(buf: &mut Vec<u8>, w: &mut dyn Write) -> PgResult<()> {
+fn flush_if_full(buf: &mut Vec<u8>, w: &mut dyn Write) -> Result<()> {
     if buf.len() >= TSV_BUF {
         w.write_all(buf)?;
         buf.clear();
@@ -607,11 +647,11 @@ mod tests {
         out
     }
 
-    /// A single corrupt txId used to cost one `u64` of filler per skipped id,
-    /// with no ceiling: a two-line, 79-byte input whose second txId is
+    /// A single corrupt txId used to cost one [`NodeId`] of filler per skipped
+    /// id, with no ceiling: a two-line, 79-byte input whose second txId is
     /// `2_147_483_647` drove RSS to 16 GiB and, under `ulimit -v`, *aborted*
-    /// the process (exit 134) instead of returning an error. Java's `HashMap`
-    /// inserted one entry.
+    /// the process (exit 134) instead of returning an error. A hash-backed map
+    /// would have inserted one entry and shrugged.
     #[test]
     fn a_lenient_gap_beyond_the_ceiling_is_refused_rather_than_allocated() {
         let mut m = DenseNodeMap::new(Mode::Lenient);
@@ -625,7 +665,7 @@ mod tests {
         match err {
             // Deliberately not `NonDenseTxId`: that one's remedy is
             // `--lenient`, which this caller is already using.
-            PgError::TxIdGapTooLarge {
+            Error::TxIdGapTooLarge {
                 line,
                 expected,
                 found,
@@ -677,13 +717,54 @@ mod tests {
         assert_eq!(m.num_outputs(4), None);
     }
 
+    /// The ids this map hands out are [`NodeId`]s, and nothing in the
+    /// arithmetic caps them at 32 bits. The dense path is a prefix sum over
+    /// `usize`, `lookup` adds a `usize` offset to a `usize` base, and
+    /// `write_tsv` formats a `usize`, so a transaction whose outputs land above
+    /// `u32::MAX` is registered, resolved and written out like any other. This
+    /// is not hypothetical headroom: the corpus at N=28 already reaches about
+    /// 2.21e9 nodes, within a factor of two of where a 32-bit id space would
+    /// have run out — hours into a run, on the id that happened to cross it.
+    ///
+    /// Starting `next_id` high is how the test reaches that region without
+    /// allocating four billion ids to walk there; the map is otherwise driven
+    /// through its ordinary entry points.
+    #[test]
+    fn ids_are_not_capped_at_thirty_two_bits() {
+        const HIGH: NodeId = 1 << 32;
+        let mut m = DenseNodeMap::new(Mode::Strict);
+        m.next_id = HIGH;
+
+        assert_eq!(register(&mut m, 0, 3), vec![HIGH, HIGH + 1, HIGH + 2]);
+        assert_eq!(register(&mut m, 1, 2), vec![HIGH + 3, HIGH + 4]);
+        assert_eq!(m.lookup(0, 2), Some(HIGH + 2));
+        assert_eq!(m.lookup(1, 1), Some(HIGH + 4));
+        assert_eq!(m.num_outputs(0), Some(3));
+        assert_eq!(m.next_id(), HIGH + 5);
+        assert_eq!(m.distinct_nodes(), HIGH as u64 + 5);
+
+        // A forced node above the ceiling behaves the same way.
+        assert_eq!(m.force_create(0, 9, 1).unwrap(), HIGH + 5);
+        assert_eq!(m.lookup(0, 9), Some(HIGH + 5));
+
+        // And every id survives the TSV round trip in full, not truncated to
+        // its low 32 bits.
+        let mut tsv = Vec::new();
+        m.write_tsv(&mut tsv).unwrap();
+        assert_eq!(
+            String::from_utf8(tsv).unwrap(),
+            "0\t0\t4294967296\n0\t1\t4294967297\n0\t2\t4294967298\n\
+             0\t9\t4294967301\n1\t0\t4294967299\n1\t1\t4294967300\n"
+        );
+    }
+
     #[test]
     fn dense_rejects_non_dense_tx_ids_in_strict_mode() {
         let mut m = DenseNodeMap::new(Mode::Strict);
         register(&mut m, 0, 1);
         let mut out = Vec::new();
         match m.register_tx(5, 1, 2, &mut out) {
-            Err(PgError::NonDenseTxId {
+            Err(Error::NonDenseTxId {
                 line: 2,
                 expected: 1,
                 found: 5,
@@ -707,8 +788,8 @@ mod tests {
 
     /// Was `dense_backwards_tx_id_is_always_an_error`. A backwards txId is no
     /// longer an error in either mode: BIP-30 makes it legitimate Bitcoin
-    /// history, and Java's `getOrCreateId` accepted it silently. The test now
-    /// asserts the id REUSE that replaced the refusal.
+    /// history, and `get_or_create` accepts it silently. The test now asserts
+    /// the id REUSE that replaced the refusal.
     #[test]
     fn dense_backwards_tx_id_reuses_the_original_ids() {
         for mode in [Mode::Strict, Mode::Lenient] {
@@ -792,7 +873,8 @@ mod tests {
     /// A repeat that declares MORE outputs than the first occurrence did. The
     /// corpus never does this, but the id space must stay sound if it ever
     /// happens: offsets the original owns come back unchanged, the surplus
-    /// offsets are keys Java would also have minted, and nothing aliases.
+    /// offsets are keys `get_or_create` would also have minted, and nothing
+    /// aliases.
     #[test]
     fn repeat_with_more_outputs_mints_only_the_overflow() {
         for mode in [Mode::Strict, Mode::Lenient] {
@@ -910,7 +992,7 @@ mod tests {
 
         for forward in [1, 2, 999] {
             match m.force_create(forward, 0, 7) {
-                Err(PgError::ForwardForcedNode {
+                Err(Error::ForwardForcedNode {
                     line: 7,
                     tx_id,
                     offset: 0,
@@ -940,7 +1022,7 @@ mod tests {
     fn force_create_refuses_everything_before_the_first_transaction() {
         let mut m = DenseNodeMap::new(Mode::Strict);
         match m.force_create(0, 0, 1) {
-            Err(PgError::ForwardForcedNode { reached: -1, .. }) => {}
+            Err(Error::ForwardForcedNode { reached: -1, .. }) => {}
             other => panic!("expected ForwardForcedNode, got {other:?}"),
         }
         assert_eq!(m.next_id(), 0);
@@ -974,16 +1056,18 @@ mod tests {
         );
     }
 
-    /// Java's `getOrCreateId`, transcribed (`PaymentGraphEdgeListBuilder.java`
-    /// lines 18-22). The oracle the deleted hash-backed map used to be.
+    /// The `get_or_create` formulation from the module documentation, written
+    /// out literally: one hash entry per `(txId, offset)` key, ids minted on
+    /// first sight. This is the oracle the deleted hash-backed map used to be,
+    /// and the semantics [`DenseNodeMap`] must reproduce exactly.
     #[derive(Default)]
-    struct JavaOracle {
-        nodes: HashMap<u64, u64>,
-        next_id: u64,
+    struct GetOrCreateOracle {
+        nodes: HashMap<u64, NodeId>,
+        next_id: NodeId,
     }
 
-    impl JavaOracle {
-        fn get_or_create(&mut self, tx: i32, offset: i32) -> u64 {
+    impl GetOrCreateOracle {
+        fn get_or_create(&mut self, tx: i32, offset: i32) -> NodeId {
             let next = &mut self.next_id;
             *self.nodes.entry(pack(tx, offset)).or_insert_with(|| {
                 let id = *next;
@@ -1005,7 +1089,7 @@ mod tests {
         }
 
         fn tsv(&self) -> String {
-            let mut rows: Vec<(i32, i32, u64)> = self
+            let mut rows: Vec<(i32, i32, NodeId)> = self
                 .nodes
                 .iter()
                 .map(|(k, v)| {
@@ -1021,11 +1105,11 @@ mod tests {
     }
 
     /// Was `dense_and_hash_agree_on_a_long_random_run`. The hash-backed map is
-    /// gone, so the counterpart is now the inline `JavaOracle` above — the same
-    /// cross-check against the same reference semantics, with the repeated and
+    /// gone, so the counterpart is now the inline `GetOrCreateOracle` above —
+    /// the same cross-check against the same semantics, with the repeated and
     /// backwards txIds that BIP-30 forced us to support folded into the run.
     #[test]
-    fn dense_matches_a_java_getorcreateid_oracle_on_a_long_random_run() {
+    fn dense_matches_a_get_or_create_oracle_on_a_long_random_run() {
         // A fixed LCG keeps this reproducible without a `rand` dependency.
         let mut state: u64 = 0x2545_F491_4F6C_DD1D;
         let mut next = move || {
@@ -1036,7 +1120,7 @@ mod tests {
         };
 
         let mut dense = DenseNodeMap::new(Mode::Strict);
-        let mut oracle = JavaOracle::default();
+        let mut oracle = GetOrCreateOracle::default();
         let mut a = Vec::new();
         let mut b = Vec::new();
         let mut probes: Vec<(i32, i32)> = Vec::new();
