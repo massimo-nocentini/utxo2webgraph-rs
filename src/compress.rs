@@ -518,8 +518,15 @@ fn finish_outputs(basename: &Path, opts: &CompressOpts, arcs: u64) -> Result<()>
 /// semantically identical but a few bits longer (measured: 237 354 versus
 /// 237 337 bits on a 2 000-node graph); `webgraph::traits::graph::eq` passes.
 /// This is inherent to chunked parallel compression rather than a quirk of this
-/// implementation — the reference compressor's output moved with its thread
-/// count too — which is why the sequential path is the default here.
+/// implementation, which is why the sequential path is the default here.
+///
+/// Confirmed at full scale. `/data/bitcoin/2022/pg/pg.graph` was compressed in
+/// parallel on a 112-core box and this pipeline's sequential `pg_28.graph` was
+/// not; the two decode to the same graph (2 181 021 971 nodes and
+/// 8 639 773 499 arcs walked in lockstep, zero differing successor lists), and
+/// differ by 397 bits spread over 73 nodes in 20 clusters — 10 of them exactly
+/// on a `ceil(nodes / 112)` boundary and all 20 within five nodes of one.
+/// `docs/pg-graph-divergence.md` has the full account.
 ///
 /// # API notes
 ///

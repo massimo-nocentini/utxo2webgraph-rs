@@ -386,9 +386,17 @@ pub struct CompressArgs {
 
     /// Compress in parallel.
     ///
-    /// Faster, but each chunk restarts its compression window, so the bytes
-    /// differ from the sequential output, which is the one that reproduces the
-    /// graphs already on disk. Semantically identical: `graph::eq` passes.
+    /// Faster, but each chunk restarts its compression window, so a node at a
+    /// chunk boundary cannot reference one before it and has to be written out
+    /// in full. The graph is identical; the bitstream is a few bits longer and
+    /// depends on the thread count, so it is only reproducible at a fixed
+    /// `--threads`. Sequential output depends on nothing, which is why it is
+    /// the default. Compare two graphs with `graph::eq`, never with `cmp`.
+    ///
+    /// Measured at `N = 28` (2 181 021 971 nodes, 112 threads): 73 nodes of
+    /// 2.18e9 encode differently, netting 397 bits over the whole 69-Gbit
+    /// stream, in 20 clusters sitting on the 112-way chunk boundaries. See
+    /// `docs/pg-graph-divergence.md`.
     #[arg(long)]
     pub parallel: bool,
 
